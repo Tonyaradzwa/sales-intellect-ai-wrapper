@@ -1,0 +1,16 @@
+[Unit]
+Description=Sales Intellect POS - Streamlit UI
+After=network.target sales-intellect-flask.service
+Wants=sales-intellect-flask.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+EnvironmentFile=/home/ubuntu/app/.env
+ExecStart=/home/ubuntu/app/.venv/bin/streamlit run app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

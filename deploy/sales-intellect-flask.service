@@ -1,0 +1,19 @@
+[Unit]
+Description=Sales Intellect POS - Flask backend
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+EnvironmentFile=/home/ubuntu/app/.env
+ExecStart=/bin/bash -c 'exec /home/ubuntu/app/.venv/bin/gunicorn \
+  --bind ${FLASK_HOST:-127.0.0.1}:${FLASK_PORT:-5050} \
+  --workers ${FLASK_WORKERS:-2} \
+  --timeout ${FLASK_TIMEOUT:-900} \
+  server:app'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[server]
+headless = true
+address = "127.0.0.1"
+port = 8501
+# fileWatcherType off in production: no need to auto-rerun on source changes,
+# and it avoids extra inotify watchers on a small instance.
+fileWatcherType = "none"
+# Cloudflare Access already gates who can reach this app, and Streamlit's own
+# same-origin CORS/XSRF checks fight the tunnel's proxying (the browser's
+# Origin is the public hostname, not localhost). Safe to relax here since the
+# edge auth is the real access control.
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
