@@ -199,6 +199,13 @@ cd /home/ubuntu/app
 
 Pulls the latest code, reinstalls `requirements.txt` only if it changed, and restarts both services.
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## Notes
 
 - No retries or pagination handling — this is intentionally bare-bones.

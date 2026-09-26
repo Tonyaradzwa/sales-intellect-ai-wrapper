@@ -372,7 +372,19 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
         # Persist edits so a follow-up paste operates on the latest state.
         st.session_state[items_key] = edited_items
 
-        if st.button("Confirm and Submit", key=f"{key_prefix}_confirm_btn"):
+        unmatched_count = sum(
+            1 for e in edited_items
+            if e["action"] in ("stock_update", "goods_received") and not e.get("matched_product_id")
+        )
+        if unmatched_count:
+            st.warning(
+                f"Fix {unmatched_count} unmatched item(s) before submitting — "
+                "select a product or delete the row."
+            )
+
+        if st.button(
+            "Confirm and Submit", key=f"{key_prefix}_confirm_btn", disabled=bool(unmatched_count)
+        ):
             missing_shop = show_shop_selector and not selected_shop_id and any(
                 e["action"] in ("stock_update", "goods_received") for e in edited_items
             )
@@ -402,6 +414,10 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
                         )
                     if resp.ok:
                         st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
+                        # Clear so the next paste starts from empty rather than
+                        # appending onto items that were already submitted.
+                        st.session_state[items_key] = []
+                        st.rerun()
                     else:
                         st.error(f"Confirm failed: {resp.json().get('error', resp.text)}")
                 except Exception as e:
@@ -411,12 +427,15 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
     if results:
         st.markdown("---")
         st.markdown("**Submission results:**")
-        for r in results:
-            label = r.get("name") or r["raw_text"]
-            if r["success"]:
-                st.success(f"✓ {label}")
-            else:
-                st.error(f"✗ {label} — {r['error']}")
+        if all(r["success"] for r in results):
+            st.success(f"✓ All {len(results)} item(s) submitted successfully.")
+        else:
+            for r in results:
+                label = r.get("name") or r["raw_text"]
+                if r["success"]:
+                    st.success(f"✓ {label}")
+                else:
+                    st.error(f"✗ {label} — {r['error']}")
 
 
 st.set_page_config(page_title="Sales Intellect POS", layout="wide")
