@@ -188,8 +188,11 @@ def _render_match_rows(items, key_prefix, action, qty_label, product_lookup):
             step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
         )
 
+        is_exact = bool(item.get("exact_match")) and chosen_id == matched_id
         if chosen_id is None:
             cols[3].caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
+        elif is_exact:
+            cols[3].caption("✓ Exact match")
 
         if cols[4].button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
             deleted_rid = rid
@@ -204,6 +207,7 @@ def _render_match_rows(items, key_prefix, action, qty_label, product_lookup):
             "code": None,
             "fields": {},
             "candidates": candidates,
+            "exact_match": is_exact,
         })
 
     return edited_items, deleted_rid

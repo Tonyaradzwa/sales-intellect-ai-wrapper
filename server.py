@@ -351,45 +351,142 @@ def _search_words(text):
     return [_stem(w) for w in words if w not in _SEARCH_STOPWORDS]
 
 
-def _search_catalog(catalog, query_text, limit=SEARCH_RESULT_LIMIT):
-    """Dependency-free tokenized search over {"product_id","name","code"} dicts.
+def _normalize_exact(name):
+    """Lowercase, trim, and collapse internal whitespace for exact-name
+    lookups. Deliberately simpler than _search_words() — no stemming or
+    size-canonicalization — so it only matches names that are really the
+    same string modulo case and spacing.
+    """
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
 
-    Ranks by how many normalized query words appear in the product name, so
-    word order and extra terms (like a leftover size/number word the query
-    wasn't fully stripped of) don't prevent a match the way literal substring
-    matching would. Ties are broken by preferring shorter names (fewer
-    unmatched extra words) and then by overall string similarity.
+
+class CatalogIndex:
+    """Built once per catalog (per /parse request) and reused for every
+    item, instead of every matching call re-scanning and re-normalizing the
+    raw catalog list from scratch.
+    """
+
+    def __init__(self, catalog):
+        self.catalog = catalog
+        self.by_id = {}
+        self.by_exact_name = {}
+        self.tokens_by_id = {}
+        self.inverted = {}
+
+        for p in catalog:
+            pid = p.get("product_id")
+            self.by_id[pid] = p
+
+            name = p.get("name") or ""
+            if not name:
+                continue
+
+            self.by_exact_name.setdefault(_normalize_exact(name), []).append(p)
+
+            tokens = _search_words(name)
+            self.tokens_by_id[pid] = tokens
+            for word in tokens:
+                self.inverted.setdefault(word, set()).add(pid)
+
+
+def _search_catalog(index, query_text, limit=SEARCH_RESULT_LIMIT):
+    """Tokenized fuzzy search over a prebuilt CatalogIndex.
+
+    The inverted index narrows the candidates to products sharing at least
+    one normalized token with the query, instead of scanning the entire
+    catalog on every call. Ranks by how many normalized query words appear
+    in the product name (word order and extra leftover terms don't prevent
+    a match), then by shorter names, then by overall string similarity.
     """
     query_words = _search_words(query_text)
     if not query_words:
         return []
 
+    candidate_ids = set()
+    for word in query_words:
+        candidate_ids.update(index.inverted.get(word, ()))
+
     scored = []
-    for p in catalog:
-        name = p.get("name") or ""
-        if not name:
-            continue
-        name_words = _search_words(name)
+    for pid in candidate_ids:
+        name_words = index.tokens_by_id[pid]
         match_count = sum(1 for w in query_words if w in name_words)
-        if match_count == 0:
-            continue
         ratio = difflib.SequenceMatcher(None, " ".join(query_words), " ".join(name_words)).ratio()
-        scored.append((match_count, -len(name_words), ratio, p))
+        scored.append((match_count, -len(name_words), ratio, index.by_id[pid]))
 
     scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
     return [{"product_id": p["product_id"], "name": p["name"]} for _, _, _, p in scored[:limit]]
 
 
-def _run_parse_agent(mode, text, catalog):
+def _find_exact_matches(index, lines):
+    """Splits each line's trailing quantity, then looks up the remaining
+    name in the exact-match index (case/whitespace-insensitive).
+
+    Returns (exact_items, remaining_lines): exact_items are finished item
+    dicts for lines with exactly one matching catalog product — no search,
+    no LLM. remaining_lines are raw lines that still need the normal
+    fuzzy/LLM path: either no exact match, or an ambiguous one (the catalog
+    has more than one product with that exact name) — never auto-accepted.
+    """
+    exact_items = []
+    remaining_lines = []
+    for raw_text in lines:
+        split = _split_trailing_quantity(raw_text)
+        matches = index.by_exact_name.get(_normalize_exact(split["name_query"]), [])
+        if len(matches) == 1:
+            p = matches[0]
+            exact_items.append({
+                "raw_text": raw_text,
+                "matched_product_id": p["product_id"],
+                "candidates": [],
+                "name": p["name"],
+                "quantity": split["quantity"],
+                "fields": {},
+                "code": p.get("code"),
+                "exact_match": True,
+            })
+        else:
+            remaining_lines.append(raw_text)
+    return exact_items, remaining_lines
+
+
+def _run_parse_agent(mode, text, index):
     """Runs the Claude Agent SDK's built-in tool-call loop to turn `text` into items.
 
-    Tools are scoped per request: search_products (both modes),
-    generate_next_product_code (new_products only), and submit_result (schema
-    depends on mode). The agent calls submit_result once per line item; each
-    call is captured here and translated into our canonical item schema.
+    For goods_received/product_updates, lines with an unambiguous exact
+    catalog-name match are resolved directly by _find_exact_matches() and
+    never reach the LLM; only the remaining lines are sent to the agent (if
+    none remain, the agent isn't invoked at all). Tools are scoped per
+    request: search_products (all modes), generate_next_product_code
+    (new_products only), and submit_result (schema depends on mode). The
+    agent calls submit_result once per line item; each call is captured
+    here and translated into our canonical item schema.
     """
     collected_items = []
-    used_codes = {c["code"] for c in catalog if c.get("code")}
+    used_codes = {p.get("code") for p in index.catalog if p.get("code")}
+
+    exact_items = []
+    if mode in ("goods_received", "product_updates"):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        exact_items, remaining_lines = _find_exact_matches(index, lines)
+        action = "goods_received" if mode == "goods_received" else "stock_update"
+        for item in exact_items:
+            item["action"] = action
+
+        if not remaining_lines:
+            return exact_items
+
+        text = "\n".join(remaining_lines)
+
+    # Accumulates search_products results since the last submit_result call,
+    # so submit_result can reuse them as `candidates` instead of re-searching.
+    pending_candidates = []
+
+    def _merge_candidates(new_results):
+        seen = {c["product_id"] for c in pending_candidates}
+        for c in new_results:
+            if c["product_id"] not in seen:
+                pending_candidates.append(c)
+                seen.add(c["product_id"])
 
     @tool(
         "search_products",
@@ -399,7 +496,8 @@ def _run_parse_agent(mode, text, catalog):
         {"query": str},
     )
     async def search_products(args):
-        results = _search_catalog(catalog, args.get("query", ""))
+        results = _search_catalog(index, args.get("query", ""))
+        _merge_candidates(results)
         text_out = json.dumps(results) if results else "No matching products found."
         return {"content": [{"type": "text", "text": text_out}]}
 
@@ -437,6 +535,7 @@ def _run_parse_agent(mode, text, catalog):
                 "quantity": args.get("quantity"),
                 "fields": args.get("fields") or {},
                 "code": args.get("suggested_product_code"),
+                "exact_match": False,
             })
             return {"content": [{"type": "text", "text": "Recorded."}]}
 
@@ -466,16 +565,19 @@ def _run_parse_agent(mode, text, catalog):
         )
         async def submit_result(args):
             matched_id = args.get("matched_product_id")
-            matched = next((p for p in catalog if p["product_id"] == matched_id), None)
+            matched = index.by_id.get(matched_id)
+            candidates = list(pending_candidates)
+            pending_candidates.clear()
             collected_items.append({
                 "action": "goods_received",
                 "raw_text": args["raw_text"],
                 "matched_product_id": matched_id,
-                "candidates": _search_catalog(catalog, args["raw_text"]),
+                "candidates": candidates,
                 "name": matched["name"] if matched else "",
                 "quantity": args.get("quantity"),
                 "fields": {},
                 "code": matched["code"] if matched else None,
+                "exact_match": False,
             })
             return {"content": [{"type": "text", "text": "Recorded."}]}
 
@@ -505,16 +607,19 @@ def _run_parse_agent(mode, text, catalog):
         )
         async def submit_result(args):
             matched_id = args.get("matched_product_id")
-            matched = next((p for p in catalog if p["product_id"] == matched_id), None)
+            matched = index.by_id.get(matched_id)
+            candidates = list(pending_candidates)
+            pending_candidates.clear()
             collected_items.append({
                 "action": "stock_update",
                 "raw_text": args["raw_text"],
                 "matched_product_id": matched_id,
-                "candidates": _search_catalog(catalog, args["raw_text"]),
+                "candidates": candidates,
                 "name": matched["name"] if matched else "",
                 "quantity": args.get("quantity"),
                 "fields": {},
                 "code": matched["code"] if matched else None,
+                "exact_match": False,
             })
             return {"content": [{"type": "text", "text": "Recorded."}]}
 
@@ -536,7 +641,7 @@ def _run_parse_agent(mode, text, catalog):
                 raise Exception(message.result or "Agent run ended in an error state.")
 
     asyncio.run(_run())
-    return collected_items
+    return exact_items + collected_items
 
 
 @app.route("/parse", methods=["POST"])
@@ -562,9 +667,10 @@ def parse():
         return jsonify({"error": f"Failed to fetch product catalog: {e}"}), 502
 
     catalog = _trimmed_catalog(products)
+    index = CatalogIndex(catalog)
 
     try:
-        items = _run_parse_agent(mode, text, catalog)
+        items = _run_parse_agent(mode, text, index)
     except Exception as e:
         return jsonify({"error": f"Agent run failed: {e}"}), 502
 
