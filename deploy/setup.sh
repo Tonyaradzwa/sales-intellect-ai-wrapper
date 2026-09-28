@@ -30,10 +30,12 @@ fi
 cd "$APP_DIR"
 
 echo "==> Installing system packages"
-if sudo dnf install -y python3.11 python3.11-pip git curl tar gzip 2>/dev/null; then
+# curl is deliberately left out: AL2023 ships curl-minimal by default, which
+# already provides the curl binary and conflicts with the full curl package.
+if sudo dnf install -y python3.11 python3.11-pip git tar gzip 2>/dev/null; then
   PYTHON_BIN="python3.11"
 else
-  sudo dnf install -y python3 python3-pip git curl tar gzip
+  sudo dnf install -y python3 python3-pip git tar gzip
   PYTHON_BIN="python3"
 fi
 
