@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-APP_DIR="/home/ubuntu/app"
+APP_DIR="/home/ec2-user/app"
 cd "$APP_DIR"
 
 OLD_HASH="$(sha256sum requirements.txt 2>/dev/null || true)"

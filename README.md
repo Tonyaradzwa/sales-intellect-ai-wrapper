@@ -136,15 +136,16 @@ Runs on a small EC2 instance behind a [Cloudflare Tunnel](https://developers.clo
 
 ### 1. Launch the EC2 instance
 
-- Ubuntu 24.04 LTS, `t4g.small`/`t3.small` (arm64 or amd64 both work) or larger.
+- Amazon Linux 2023, `t4g.small`/`t3.small` (arm64 or amd64 both work) or larger.
 - Security group: allow inbound SSH (22) **from your IP only**. No other inbound ports — the tunnel makes an outbound connection from the instance to Cloudflare, so nothing needs to be opened for web traffic.
 
 ### 2. Clone the repo and configure secrets
 
 ```bash
-ssh ubuntu@<instance-ip>
-git clone <this-repo-url> /home/ubuntu/app
-cd /home/ubuntu/app
+ssh ec2-user@<instance-ip>
+sudo dnf install -y git   # Amazon Linux doesn't ship git by default
+git clone <this-repo-url> /home/ec2-user/app
+cd /home/ec2-user/app
 cp .env.example .env
 nano .env   # fill in SI_API_TOKEN and ANTHROPIC_API_KEY at minimum
 ```
@@ -173,7 +174,7 @@ In the tunnel's config (`~/.cloudflared/config.yml`), point the hostname at the 
 
 ```yaml
 tunnel: <tunnel-id>
-credentials-file: /home/ubuntu/.cloudflared/<tunnel-id>.json
+credentials-file: /home/ec2-user/.cloudflared/<tunnel-id>.json
 ingress:
   - hostname: app.<yourdomain>
     service: http://localhost:8501
@@ -193,7 +194,7 @@ In the Cloudflare dashboard, add an Access application for `app.<yourdomain>` an
 ### 6. Deploying updates
 
 ```bash
-cd /home/ubuntu/app
+cd /home/ec2-user/app
 ./deploy/update.sh
 ```
 

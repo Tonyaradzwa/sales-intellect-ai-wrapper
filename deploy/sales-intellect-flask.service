@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/app
-EnvironmentFile=/home/ubuntu/app/.env
-ExecStart=/bin/bash -c 'exec /home/ubuntu/app/.venv/bin/gunicorn \
+User=ec2-user
+WorkingDirectory=/home/ec2-user/app
+EnvironmentFile=/home/ec2-user/app/.env
+ExecStart=/bin/bash -c 'exec /home/ec2-user/app/.venv/bin/gunicorn \
   --bind ${FLASK_HOST:-127.0.0.1}:${FLASK_PORT:-5050} \
   --workers ${FLASK_WORKERS:-2} \
   --timeout ${FLASK_TIMEOUT:-900} \

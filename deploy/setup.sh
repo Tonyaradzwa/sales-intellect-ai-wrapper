@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# One-time provisioning for a fresh Ubuntu 24.04 EC2 instance (arm64 or
+# One-time provisioning for a fresh Amazon Linux 2023 EC2 instance (arm64 or
 # amd64). Safe to re-run: every step checks current state before acting.
 #
-# Assumes this repo has already been cloned to /home/ubuntu/app and this
-# script is being run as the `ubuntu` user (it uses sudo for privileged
+# Assumes this repo has already been cloned to /home/ec2-user/app and this
+# script is being run as the `ec2-user` user (it uses sudo for privileged
 # steps) from inside that checkout, e.g.:
 #
-#   git clone <repo-url> /home/ubuntu/app
-#   cd /home/ubuntu/app
+#   git clone <repo-url> /home/ec2-user/app
+#   cd /home/ec2-user/app
 #   cp .env.example .env && nano .env   # fill in real values
 #   ./deploy/setup.sh
 
 set -euo pipefail
 
-APP_DIR="/home/ubuntu/app"
+APP_DIR="/home/ec2-user/app"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "$SCRIPT_DIR" != "$APP_DIR/deploy" ]; then
@@ -22,16 +22,20 @@ if [ "$SCRIPT_DIR" != "$APP_DIR/deploy" ]; then
   exit 1
 fi
 
-if [ "$(whoami)" != "ubuntu" ]; then
-  echo "Run this as the ubuntu user (the systemd units use User=ubuntu)." >&2
+if [ "$(whoami)" != "ec2-user" ]; then
+  echo "Run this as the ec2-user user (the systemd units use User=ec2-user)." >&2
   exit 1
 fi
 
 cd "$APP_DIR"
 
 echo "==> Installing system packages"
-sudo apt-get update -y
-sudo apt-get install -y python3 python3-venv python3-pip git curl ca-certificates
+if sudo dnf install -y python3.11 python3.11-pip git curl tar gzip 2>/dev/null; then
+  PYTHON_BIN="python3.11"
+else
+  sudo dnf install -y python3 python3-pip git curl tar gzip
+  PYTHON_BIN="python3"
+fi
 
 echo "==> Checking RAM / swap"
 TOTAL_RAM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
@@ -53,8 +57,8 @@ fi
 
 echo "==> Installing Node.js 22 (if missing)"
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/^v//' | cut -d. -f1)" -lt 22 ]; then
-  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo -E bash -
+  sudo dnf install -y nodejs
 else
   echo "    Node $(node -v) already installed — skipping."
 fi
@@ -67,7 +71,7 @@ else
 fi
 
 echo "==> Pre-seeding Claude CLI project trust (defensive; SDK/headless runs don't need this, but costs nothing)"
-python3 - "$APP_DIR" <<'EOF'
+"$PYTHON_BIN" - "$APP_DIR" <<'EOF'
 import json
 import os
 import sys
@@ -105,7 +109,7 @@ fi
 
 echo "==> Creating virtualenv"
 if [ ! -d "$APP_DIR/.venv" ]; then
-  python3 -m venv "$APP_DIR/.venv"
+  "$PYTHON_BIN" -m venv "$APP_DIR/.venv"
 fi
 
 echo "==> Installing Python requirements"
