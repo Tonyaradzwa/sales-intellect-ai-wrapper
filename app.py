@@ -17,6 +17,15 @@ from client import SalesIntellectClient
 
 BACKEND_URL = os.environ.get("SI_BACKEND_URL", "http://127.0.0.1:5050")
 
+# Prod and preprod are two separate deployments of this same codebase, each
+# with its own .env (and crucially its own SI_API_TOKEN — see .env.example).
+# APP_ENV just controls the visual "you are in production" tell below; it
+# doesn't switch which API key is used — that's whatever SI_API_TOKEN is set
+# to on this instance.
+APP_ENV = os.environ.get("APP_ENV", "preprod").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+PREPROD_URL = os.environ.get("PREPROD_URL", "")
+
 # Per-tab feature flags, and the order tabs render in. Toggle via env vars
 # (e.g. SI_TAB_PRODUCT_UPDATES=true) without touching this file.
 TAB_CONFIG = [
@@ -442,7 +451,42 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
                     st.error(f"✗ {label} — {r['error']}")
 
 
+def _render_production_banner():
+    """Fixed corner banner + subtle red tint, so it's unmistakable that
+    actions here hit the real Sales Intellect account (not preprod)."""
+    if PREPROD_URL:
+        link_html = (
+            f'<a href="{PREPROD_URL}" target="_blank" '
+            'style="color:#fff;text-decoration:underline;font-weight:600;">'
+            "Go to preprod →</a>"
+        )
+    else:
+        link_html = '<span style="opacity:0.75;">(PREPROD_URL not set)</span>'
+
+    st.markdown(
+        f"""
+        <div style="
+            position: fixed; top: 0.6rem; left: 1rem; z-index: 1000000;
+            background: #b91c1c; color: #fff; padding: 6px 14px;
+            border-radius: 6px; font-size: 0.8rem; letter-spacing: 0.03em;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+        ">
+            \U0001F534 <strong>PRODUCTION</strong> &nbsp;|&nbsp; {link_html}
+        </div>
+        <style>
+        [data-testid="stAppViewContainer"] {{ border-top: 4px solid #b91c1c; }}
+        [data-testid="stHeader"] {{ background-color: rgba(185, 28, 28, 0.08); }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 st.set_page_config(page_title="Sales Intellect POS", layout="wide")
+
+if IS_PRODUCTION:
+    _render_production_banner()
+
 st.title("Sales Intellect POS", anchor=False)
 
 try:

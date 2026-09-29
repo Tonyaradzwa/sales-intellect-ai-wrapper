@@ -191,7 +191,16 @@ sudo cloudflared service install
 
 In the Cloudflare dashboard, add an Access application for `app.<yourdomain>` and a policy allowing your staff's email addresses (or your workspace's email domain). Staff will be prompted to authenticate before Cloudflare ever forwards a request to the tunnel.
 
-### 6. Deploying updates
+### 6. Prod vs preprod
+
+Prod and preprod are two separate instances of this same setup (e.g. two EC2 boxes, or two tunnel hostnames pointed at two checkouts) — not a toggle inside one running app. Each gets its own `.env`:
+
+- Preprod: `SI_API_TOKEN` set to the preprod Sales Intellect token, `APP_ENV` left as `preprod`.
+- Prod: `SI_API_TOKEN` set to the production token, `APP_ENV=production`, and `PREPROD_URL` set to the preprod instance's URL.
+
+The prod instance then shows a red "PRODUCTION" banner in the corner (with a link back to preprod) and a subtle red tint, so it's visually obvious which one you're looking at.
+
+### 7. Deploying updates
 
 ```bash
 cd /home/ec2-user/app
