@@ -32,6 +32,15 @@ PRODUCTS = [
     {"id": "p3", "product_name": "Item B1", "product_code": "B001"},
 ]
 
+# Shape returned by GET /catalog (server.py's get_catalog()): product_id/
+# name/code/cost, not the raw Sales Intellect API's id/product_name/
+# product_code — app.py now fetches the catalog from the backend's cache
+# instead of calling SalesIntellectClient.list_products() directly.
+CATALOG_PRODUCTS = [
+    {"product_id": p["id"], "name": p["product_name"], "code": p["product_code"], "cost": 0}
+    for p in PRODUCTS
+]
+
 PARSE_RESPONSES = {
     "PASTE_A": [
         {"raw_text": "Item A1 x5", "matched_product_id": "p1", "quantity": 5,
@@ -95,8 +104,18 @@ def confirm_payloads(monkeypatch):
             return FakeResponse(200, {"results": results})
         raise AssertionError(f"Unexpected URL: {url}")
 
+    def fake_get(url, timeout=None):
+        if url.endswith("/catalog"):
+            return FakeResponse(200, {
+                "products": CATALOG_PRODUCTS,
+                "fetched_at": "2026-01-01T00:00:00",
+                "count": len(CATALOG_PRODUCTS),
+            })
+        raise AssertionError(f"Unexpected URL: {url}")
+
     import requests
     monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests, "get", fake_get)
 
     return captured
 

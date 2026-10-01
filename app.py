@@ -13,6 +13,7 @@ import uuid
 import requests
 import streamlit as st
 
+import timing
 from client import SalesIntellectClient
 
 BACKEND_URL = os.environ.get("SI_BACKEND_URL", "http://127.0.0.1:5050")
@@ -117,16 +118,24 @@ def _supplier_options(suppliers):
 
 
 def _product_lookup(products):
-    """id -> {"name", "code"}, from a raw list_products() response."""
-    if isinstance(products, dict):
-        for value in products.values():
-            if isinstance(value, list):
-                products = value
-                break
+    """id -> {"name", "code"}, from the cached catalog (GET /catalog's
+    {product_id, name, code, cost} shape — see server.py's get_catalog())."""
     lookup = {}
     for p in products:
-        lookup[p.get("id")] = {"name": p.get("product_name"), "code": p.get("product_code")}
+        lookup[p.get("product_id")] = {"name": p.get("name"), "code": p.get("code")}
     return lookup
+
+
+def _fetch_catalog():
+    """Fetches the shared, backend-cached product catalog. Normally served
+    from the backend's in-memory/file cache (fast), but when there's no
+    cache file yet (e.g. first run), this triggers the same full live,
+    paginated fetch as "Refresh Catalog" — hence the generous timeout,
+    matching POST /catalog/refresh below."""
+    with timing.timed("http_get_catalog"):
+        resp = requests.get(f"{BACKEND_URL}/catalog", timeout=120)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _with_row_ids(items):
@@ -222,13 +231,20 @@ def _render_match_rows(items, key_prefix, action, qty_label, product_lookup):
     return edited_items, deleted_rid
 
 
-def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplier_selector=False, subheader=None):
+def render_parse_tab(
+    key_prefix, mode, caption, show_shop_selector, show_supplier_selector=False,
+    subheader=None, catalog_products=None,
+):
     """Shared paste -> review -> confirm flow.
 
     mode: "product_updates" (every item is a stock_update matched against the
     existing catalog), "new_products" (every item is a brand new product, no
     shop needed), or "goods_received" (every item is added to stock via a
     GRN — needs both a shop and a supplier).
+
+    catalog_products: the shared, already-fetched catalog (see GET /catalog),
+    passed down from the top of the script so multiple tabs in one rerun
+    don't each fetch it separately.
     """
     if subheader:
         st.subheader(subheader)
@@ -290,28 +306,38 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
     )
 
     if st.button("Read items", key=f"{key_prefix}_read_btn") and paste_text:
-        try:
-            # A large paste (e.g. a full delivery's worth of GRN lines) can
-            # take a couple of minutes — each line goes through several
-            # agent tool calls. 90s was too short and produced a client-side
-            # timeout even though the backend was still working correctly
-            # (confirmed: 42 items completed in ~133s, all matched).
-            with st.spinner("Parsing — large pastes can take a minute or two…"):
-                resp = requests.post(
-                    f"{BACKEND_URL}/parse",
-                    json={"text": paste_text, "mode": mode},
-                    timeout=600,
-                )
-            if resp.ok:
-                new_items = _with_row_ids(resp.json()["items"])
-                existing_items = st.session_state.get(items_key) or []
-                st.session_state[items_key] = existing_items + new_items
-                st.session_state[f"{key_prefix}_confirm_results"] = None
-                st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
-            else:
-                st.session_state[status_key] = f"Couldn't process that: {resp.json().get('error', resp.text)}"
-        except Exception as e:
-            st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
+        run_id = timing.new_run_id()
+        with timing.section(
+            "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, paste_chars=len(paste_text),
+            paste_lines=len(paste_text.splitlines()),
+        ):
+            try:
+                # A large paste (e.g. a full delivery's worth of GRN lines) can
+                # take a couple of minutes — each line goes through several
+                # agent tool calls. 90s was too short and produced a client-side
+                # timeout even though the backend was still working correctly
+                # (confirmed: 42 items completed in ~133s, all matched).
+                with st.spinner("Parsing — large pastes can take a minute or two…"):
+                    with timing.timed("http_post_parse"):
+                        resp = requests.post(
+                            f"{BACKEND_URL}/parse",
+                            json={"text": paste_text, "mode": mode},
+                            timeout=600,
+                        )
+                if resp.ok:
+                    new_items = _with_row_ids(resp.json()["items"])
+                    existing_items = st.session_state.get(items_key) or []
+                    st.session_state[items_key] = existing_items + new_items
+                    st.session_state[f"{key_prefix}_confirm_results"] = None
+                    st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
+                    timing.log("parse_result", items_added=len(new_items))
+                else:
+                    error = resp.json().get("error", resp.text)
+                    st.session_state[status_key] = f"Couldn't process that: {error}"
+                    timing.log("parse_failed", error=error)
+            except Exception as e:
+                st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
+                timing.log("parse_exception", error=str(e))
 
         st.rerun()
 
@@ -366,11 +392,7 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
                 })
 
         else:  # product_updates (stock_update) or goods_received: matched against the catalog
-            try:
-                product_lookup = _product_lookup(client.list_products())
-            except Exception as e:
-                product_lookup = {}
-                st.error(f"Could not load product catalog: {e}")
+            product_lookup = _product_lookup(catalog_products or [])
 
             action = "goods_received" if mode == "goods_received" else "stock_update"
             qty_label = "Qty" if mode == "goods_received" else "Qty / Δ"
@@ -410,31 +432,40 @@ def render_parse_tab(key_prefix, mode, caption, show_shop_selector, show_supplie
                 st.warning("Select a supplier first.")
             else:
                 payload_items = [{k: v for k, v in it.items() if k != "_rid"} for it in edited_items]
-                try:
-                    with st.spinner("Submitting…"):
-                        resp = requests.post(
-                            f"{BACKEND_URL}/confirm",
-                            json={
-                                "shop_id": selected_shop_id,
-                                "supplier_id": selected_supplier_id,
-                                "items": payload_items,
-                            },
-                            # stock_update does two HTTP calls per item
-                            # (get_inventory + set_inventory), so a large
-                            # batch can add up — same false-timeout risk
-                            # as /parse.
-                            timeout=300,
-                        )
-                    if resp.ok:
-                        st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
-                        # Clear so the next paste starts from empty rather than
-                        # appending onto items that were already submitted.
-                        st.session_state[items_key] = []
-                        st.rerun()
-                    else:
-                        st.error(f"Confirm failed: {resp.json().get('error', resp.text)}")
-                except Exception as e:
-                    st.error(f"Could not reach confirm backend at {BACKEND_URL}: {e}")
+                run_id = timing.new_run_id()
+                with timing.section(
+                    "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
+                ):
+                    try:
+                        with st.spinner("Submitting…"):
+                            with timing.timed("http_post_confirm"):
+                                resp = requests.post(
+                                    f"{BACKEND_URL}/confirm",
+                                    json={
+                                        "shop_id": selected_shop_id,
+                                        "supplier_id": selected_supplier_id,
+                                        "items": payload_items,
+                                    },
+                                    # stock_update does two HTTP calls per item
+                                    # (get_inventory + set_inventory), so a large
+                                    # batch can add up — same false-timeout risk
+                                    # as /parse.
+                                    timeout=300,
+                                )
+                        if resp.ok:
+                            st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
+                            # Clear so the next paste starts from empty rather than
+                            # appending onto items that were already submitted.
+                            st.session_state[items_key] = []
+                            timing.log("confirm_result", results=len(st.session_state[f"{key_prefix}_confirm_results"]))
+                            st.rerun()
+                        else:
+                            error = resp.json().get("error", resp.text)
+                            st.error(f"Confirm failed: {error}")
+                            timing.log("confirm_failed", error=error)
+                    except Exception as e:
+                        st.error(f"Could not reach confirm backend at {BACKEND_URL}: {e}")
+                        timing.log("confirm_exception", error=str(e))
 
     results = st.session_state.get(f"{key_prefix}_confirm_results")
     if results:
@@ -495,12 +526,53 @@ except ValueError as e:
     st.error(str(e))
     st.stop()
 
+# Shared product catalog, fetched once per rerun from the backend's cache
+# (never the live Sales Intellect API directly — see _fetch_catalog()) and
+# passed down to every tab below, so multiple enabled tabs in one rerun
+# don't each fetch it separately.
+catalog_products = []
+catalog_col, refresh_col = st.columns([5, 1])
+try:
+    catalog_data = _fetch_catalog()
+    catalog_products = catalog_data.get("products", [])
+    fetched_at = catalog_data.get("fetched_at")
+    cache_found = catalog_data.get("cache_found", True)
+    with catalog_col:
+        if not cache_found:
+            st.warning(catalog_data.get("message") or "No catalog cache found on server — click \"Refresh Catalog\".")
+        else:
+            st.caption(
+                f"Product catalog: {len(catalog_products)} products"
+                + (f" · last refreshed {fetched_at}" if fetched_at else "")
+            )
+except Exception as e:
+    with catalog_col:
+        st.caption(f"Could not load product catalog: {e}")
+
+with refresh_col:
+    if st.button("Refresh Catalog", key="global_catalog_refresh"):
+        run_id = timing.new_run_id()
+        with timing.section("FRONTEND: REFRESH CATALOG", run_id=run_id):
+            try:
+                with timing.timed("http_post_catalog_refresh"):
+                    resp = requests.post(f"{BACKEND_URL}/catalog/refresh", timeout=120)
+                if resp.ok:
+                    timing.log("catalog_refresh_result", count=resp.json().get("count"))
+                else:
+                    error = resp.json().get("error", resp.text)
+                    st.error(f"Refresh failed: {error}")
+                    timing.log("catalog_refresh_failed", error=error)
+            except Exception as e:
+                st.error(f"Could not reach backend at {BACKEND_URL}: {e}")
+                timing.log("catalog_refresh_exception", error=str(e))
+        st.rerun()
+
 enabled_tabs = [t for t in TAB_CONFIG if t["enabled"]]
 
 if len(enabled_tabs) == 1:
-    render_parse_tab(**enabled_tabs[0]["render_kwargs"])
+    render_parse_tab(catalog_products=catalog_products, **enabled_tabs[0]["render_kwargs"])
 elif enabled_tabs:
     tabs = st.tabs([t["label"] for t in enabled_tabs])
     for tab_widget, tab_def in zip(tabs, enabled_tabs):
         with tab_widget:
-            render_parse_tab(**tab_def["render_kwargs"])
+            render_parse_tab(catalog_products=catalog_products, **tab_def["render_kwargs"])

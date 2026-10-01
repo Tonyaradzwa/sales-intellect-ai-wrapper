@@ -1,14 +1,17 @@
 """Simple client for the Sales Intellect POS API."""
 
 import os
+import time
 
 import requests
+
+import timing
 
 BASE_URL = "https://api.salesintellectpos.com/v1.0"
 
 # Shared page size for the API's cursor-based listing endpoints (/products,
 # /inventory) — both require limit/cursor in the JSON body, not query params.
-PAGE_LIMIT = 100
+PAGE_LIMIT = 250
 
 
 class SalesIntellectClient:
@@ -23,11 +26,15 @@ class SalesIntellectClient:
         self.session.headers.update({"Authorization": f"Bearer {self.token}"})
 
     def _request(self, method, path, **kwargs):
+        t0 = time.perf_counter()
         response = self.session.request(method, f"{BASE_URL}{path}", **kwargs)
+        dur = time.perf_counter() - t0
         if not response.ok:
+            timing.log(f"API {method} {path} FAILED", dur=dur, status=response.status_code)
             raise Exception(
                 f"{method} {path} failed with status {response.status_code}: {response.text}"
             )
+        timing.log(f"API {method} {path}", dur=dur, status=response.status_code)
         return response.json()
 
     def list_products(self):
@@ -42,18 +49,23 @@ class SalesIntellectClient:
         condition is an empty `products` list, never "cursor is missing" or
         "cursor didn't change".
         """
-        products = []
-        cursor = None
-        while True:
-            body = {"limit": PAGE_LIMIT}
-            if cursor is not None:
-                body["cursor"] = cursor
-            page = self._request("GET", "/products", json=body)
-            page_products = page.get("products", [])
-            if not page_products:
-                break
-            products.extend(page_products)
-            cursor = page.get("cursor")
+        with timing.section("FETCHING PRODUCT CATALOG (list_products)"):
+            products = []
+            cursor = None
+            page_num = 0
+            while True:
+                page_num += 1
+                body = {"limit": PAGE_LIMIT}
+                if cursor is not None:
+                    body["cursor"] = cursor
+                page = self._request("GET", "/products", json=body)
+                page_products = page.get("products", [])
+                timing.log(f"page {page_num}", returned=len(page_products))
+                if not page_products:
+                    break
+                products.extend(page_products)
+                cursor = page.get("cursor")
+            timing.log("list_products complete", pages=page_num, total_products=len(products))
         return products
 
     def upsert_product(self, data):
@@ -64,18 +76,23 @@ class SalesIntellectClient:
 
     def list_suppliers(self):
         """Fetch every supplier, paging like list_products()."""
-        suppliers = []
-        cursor = None
-        while True:
-            body = {"limit": PAGE_LIMIT}
-            if cursor is not None:
-                body["cursor"] = cursor
-            page = self._request("GET", "/suppliers", json=body)
-            page_suppliers = page.get("suppliers", [])
-            if not page_suppliers:
-                break
-            suppliers.extend(page_suppliers)
-            cursor = page.get("cursor")
+        with timing.section("FETCHING SUPPLIERS (list_suppliers)"):
+            suppliers = []
+            cursor = None
+            page_num = 0
+            while True:
+                page_num += 1
+                body = {"limit": PAGE_LIMIT}
+                if cursor is not None:
+                    body["cursor"] = cursor
+                page = self._request("GET", "/suppliers", json=body)
+                page_suppliers = page.get("suppliers", [])
+                timing.log(f"page {page_num}", returned=len(page_suppliers))
+                if not page_suppliers:
+                    break
+                suppliers.extend(page_suppliers)
+                cursor = page.get("cursor")
+            timing.log("list_suppliers complete", pages=page_num, total_suppliers=len(suppliers))
         return suppliers
 
     def create_grn(self, data):
@@ -92,18 +109,23 @@ class SalesIntellectClient:
         non-null value past the last page too, so termination is on an
         empty inventory_levels list only.
         """
-        levels = []
-        cursor = None
-        while True:
-            body = {"shop_ids": [shop_id], "limit": PAGE_LIMIT}
-            if cursor is not None:
-                body["cursor"] = cursor
-            page = self._request("GET", "/inventory", json=body)
-            page_levels = page.get("inventory_levels", [])
-            if not page_levels:
-                break
-            levels.extend(page_levels)
-            cursor = page.get("cursor")
+        with timing.section("FETCHING INVENTORY (get_inventory)", shop_id=shop_id):
+            levels = []
+            cursor = None
+            page_num = 0
+            while True:
+                page_num += 1
+                body = {"shop_ids": [shop_id], "limit": PAGE_LIMIT}
+                if cursor is not None:
+                    body["cursor"] = cursor
+                page = self._request("GET", "/inventory", json=body)
+                page_levels = page.get("inventory_levels", [])
+                timing.log(f"page {page_num}", returned=len(page_levels))
+                if not page_levels:
+                    break
+                levels.extend(page_levels)
+                cursor = page.get("cursor")
+            timing.log("get_inventory complete", pages=page_num, total_levels=len(levels))
         return levels
 
     def set_inventory(self, shop_id, product_id, in_stock):
@@ -115,18 +137,19 @@ class SalesIntellectClient:
         return self._request("POST", "/inventory", json=body)
 
     def adjust_inventory(self, shop_id, product_id, delta):
-        levels = self.get_inventory(shop_id)
-        if isinstance(levels, dict):
-            levels = levels.get("inventory_levels", [])
-        current = None
-        for level in levels:
-            if level.get("product_id") == product_id:
-                current = level.get("in_stock")
-                break
-        if current is None:
-            raise Exception(
-                f"Could not find current inventory for product_id={product_id} "
-                f"at shop_id={shop_id}"
-            )
-        new_total = current + delta
-        return self.set_inventory(shop_id, product_id, new_total)
+        with timing.section("ADJUST INVENTORY", shop_id=shop_id, product_id=product_id, delta=delta):
+            levels = self.get_inventory(shop_id)
+            if isinstance(levels, dict):
+                levels = levels.get("inventory_levels", [])
+            current = None
+            for level in levels:
+                if level.get("product_id") == product_id:
+                    current = level.get("in_stock")
+                    break
+            if current is None:
+                raise Exception(
+                    f"Could not find current inventory for product_id={product_id} "
+                    f"at shop_id={shop_id}"
+                )
+            new_total = current + delta
+            return self.set_inventory(shop_id, product_id, new_total)
