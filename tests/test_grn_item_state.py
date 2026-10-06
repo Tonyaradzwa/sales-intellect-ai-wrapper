@@ -85,6 +85,10 @@ def confirm_payloads(monkeypatch):
     os.environ["SI_TAB_GOODS_RECEIVED"] = "true"
     os.environ["SI_TAB_PRODUCT_UPDATES"] = "false"
     os.environ["SI_TAB_BULK_UPLOAD"] = "false"
+    # These tests exercise the classic read-items -> review -> confirm flow
+    # specifically (grn_read_btn/grn_confirm_btn) — SKIP REVIEW has its own
+    # suite in test_grn_skip_review.py.
+    os.environ["SI_GRN_SKIP_REVIEW"] = "false"
 
     monkeypatch.setattr(client_module.SalesIntellectClient, "list_shops", lambda self: SHOPS)
     monkeypatch.setattr(client_module.SalesIntellectClient, "list_suppliers", lambda self: SUPPLIERS)

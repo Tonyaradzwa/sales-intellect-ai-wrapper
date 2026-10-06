@@ -537,7 +537,7 @@ def render_parse_tab(
         with st.container(border=True):
             st.write(st.session_state[status_key])
 
-    skip_review = mode == "goods_received" and _env_flag("SI_GRN_SKIP_REVIEW")
+    skip_review = mode == "goods_received" and _env_flag("SI_GRN_SKIP_REVIEW", default="true")
 
     if skip_review:
         _render_grn_skip_review(
