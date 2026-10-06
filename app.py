@@ -18,6 +18,10 @@ from client import SalesIntellectClient
 
 BACKEND_URL = os.environ.get("SI_BACKEND_URL", "http://127.0.0.1:5050")
 
+
+def _env_flag(name, default="false"):
+    return os.environ.get(name, default).strip().lower() == "true"
+
 # Prod and preprod are two separate deployments of this same codebase, each
 # with its own .env (and crucially its own SI_API_TOKEN — see .env.example).
 # APP_ENV just controls the visual "you are in production" tell below; it
@@ -111,7 +115,10 @@ def _supplier_options(suppliers):
     for s in suppliers:
         supplier_id = s.get("id")
         label = s.get("supplier_name") or s.get("supplier_id") or supplier_id
-        if s.get("supplier_id") and s.get("supplier_id") != label:
+        # "N/A" is the catch-all supplier for deliveries with no tracked
+        # supplier account — showing its internal code (e.g. "N/A (COM1)")
+        # is just noise for staff.
+        if label != "N/A" and s.get("supplier_id") and s.get("supplier_id") != label:
             label = f"{label} ({s['supplier_id']})"
         options[label] = supplier_id
     return options
@@ -144,28 +151,60 @@ def _with_row_ids(items):
     return items
 
 
-def _render_match_rows(items, key_prefix, action, qty_label, product_lookup):
+# Match-status -> (background tint, left-border accent) for the color-coded
+# name field in compact mode. Transparent backgrounds so text stays readable
+# in both light and dark themes.
+_MATCH_STATUS_STYLE = {
+    "exact": ("rgba(34, 197, 94, 0.16)", "#22c55e"),
+    "fuzzy": ("rgba(234, 179, 8, 0.18)", "#eab308"),
+    "unmatched": ("rgba(239, 68, 68, 0.16)", "#ef4444"),
+}
+
+
+def _render_match_rows(
+    items, key_prefix, action, qty_label, product_lookup, compact=False,
+    hide_statuses=frozenset(), hidden_caption=None,
+):
     """Shared review-table rendering for both product_updates (stock_update)
     and goods_received: a dropdown to confirm/override the matched product,
-    its code, a quantity field, and a delete button.
+    a quantity field, and a delete button.
+
+    compact: GRN's simplified layout — no separate Code column (the product
+    name option already shows "Name (CODE)") and no separate Flag column;
+    instead the name field itself is color-coded (green = exact match,
+    yellow = matched but not exact, red = unmatched) via _MATCH_STATUS_STYLE.
+
+    hide_statuses (compact only): statuses ("exact", "fuzzy", "unmatched")
+    to skip rendering entirely — those items are passed through unchanged,
+    so only the statuses left out need a look. Used for GRN's trust mode
+    ({"exact"}) and SKIP REVIEW's flagged-only correction view
+    ({"exact", "fuzzy"}).
+
+    hidden_caption: if given and at least one row was hidden, shown as
+    hidden_caption.format(n=hidden_count) below the table.
     """
     all_options = sorted(
         ((pid, f"{info['name']} ({info['code']})") for pid, info in product_lookup.items()),
         key=lambda pair: pair[1],
     )
 
-    widths = [4.5, 1.1, 1, 2, 0.5]
-    headers = ["Product / Match", "Code", qty_label, "Flag", ""]
+    if compact:
+        widths = [5.5, 1, 0.5]
+        headers = ["Product", qty_label, ""]
+    else:
+        widths = [4.5, 1.1, 1, 2, 0.5]
+        headers = ["Product / Match", "Code", qty_label, "Flag", ""]
 
     for col, header in zip(st.columns(widths), headers):
         col.markdown(f"**{header}**")
 
     edited_items = []
     deleted_rid = None
+    row_styles = []  # [(css_key, status)] collected for the single style block below
+    hidden_count = 0
 
     for item in items:
         rid = item["_rid"]
-        cols = st.columns(widths)
 
         candidates = item.get("candidates") or []
         matched_id = item.get("matched_product_id")
@@ -189,30 +228,74 @@ def _render_match_rows(items, key_prefix, action, qty_label, product_lookup):
         labels_ordered = ["— select a product —"] + [option_labels[pid] for pid in option_ids]
         default_index = ids_ordered.index(matched_id) if matched_id in ids_ordered else 0
 
-        chosen_label = cols[0].selectbox(
-            "Matched product", labels_ordered, index=default_index,
-            key=f"{key_prefix}_match_{rid}", label_visibility="collapsed",
-        )
+        # Backend's verdict before any user interaction — used to decide
+        # whether this row can be skipped untouched (hide_statuses).
+        backend_exact = bool(item.get("exact_match")) and matched_id is not None
+        backend_status = "exact" if backend_exact else ("unmatched" if matched_id is None else "fuzzy")
+
+        if compact and backend_status in hide_statuses:
+            # Trusted as-is — still included in the submitted payload, just
+            # not rendered, so there's nothing to review.
+            hidden_count += 1
+            edited_items.append({
+                "_rid": rid,
+                "raw_text": item.get("raw_text", ""),
+                "action": action,
+                "matched_product_id": matched_id,
+                "quantity": int(item.get("quantity") or 0),
+                "name": product_lookup.get(matched_id, {}).get("name") or item.get("raw_text", ""),
+                "code": None,
+                "fields": {},
+                "candidates": candidates,
+                "exact_match": backend_exact,
+            })
+            continue
+
+        cols = st.columns(widths)
+
+        if compact:
+            name_cell_key = f"{key_prefix}_namecell_{rid}"
+            name_cell = cols[0].container(key=name_cell_key)
+            chosen_label = name_cell.selectbox(
+                "Matched product", labels_ordered, index=default_index,
+                key=f"{key_prefix}_match_{rid}", label_visibility="collapsed",
+            )
+        else:
+            chosen_label = cols[0].selectbox(
+                "Matched product", labels_ordered, index=default_index,
+                key=f"{key_prefix}_match_{rid}", label_visibility="collapsed",
+            )
+            code = product_lookup.get(matched_id, {}).get("code", "")
+            cols[1].text_input(
+                "Code", value=code, key=f"{key_prefix}_code_display_{rid}",
+                label_visibility="collapsed", disabled=True,
+            )
+
         chosen_id = ids_ordered[labels_ordered.index(chosen_label)]
+        is_exact = bool(item.get("exact_match")) and chosen_id == matched_id
+        status = "exact" if is_exact else ("unmatched" if chosen_id is None else "fuzzy")
 
-        code = product_lookup.get(chosen_id, {}).get("code", "")
-        cols[1].text_input(
-            "Code", value=code, key=f"{key_prefix}_code_display_{rid}",
-            label_visibility="collapsed", disabled=True,
-        )
+        if compact:
+            if status == "unmatched":
+                name_cell.caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
+            elif status == "fuzzy":
+                name_cell.caption("Not an exact match — please confirm")
+            row_styles.append((name_cell_key, status))
 
-        qty = cols[2].number_input(
+        qty_col = cols[1] if compact else cols[2]
+        qty = qty_col.number_input(
             qty_label, value=int(item.get("quantity") or 0),
             step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
         )
 
-        is_exact = bool(item.get("exact_match")) and chosen_id == matched_id
-        if chosen_id is None:
-            cols[3].caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
-        elif is_exact:
-            cols[3].caption("✓ Exact match")
+        if not compact:
+            if chosen_id is None:
+                cols[3].caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
+            elif is_exact:
+                cols[3].caption("✓ Exact match")
 
-        if cols[4].button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
+        del_col = cols[2] if compact else cols[4]
+        if del_col.button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
             deleted_rid = rid
 
         edited_items.append({
@@ -228,7 +311,156 @@ def _render_match_rows(items, key_prefix, action, qty_label, product_lookup):
             "exact_match": is_exact,
         })
 
+    if row_styles:
+        rules = "\n".join(
+            f'.st-key-{css_key} {{ background-color: {_MATCH_STATUS_STYLE[status][0]}; '
+            f'border-left: 4px solid {_MATCH_STATUS_STYLE[status][1]}; '
+            f"border-radius: 6px; padding: 6px 10px; }}"
+            for css_key, status in row_styles
+        )
+        st.markdown(f"<style>{rules}</style>", unsafe_allow_html=True)
+
+    if compact and hidden_caption and hidden_count:
+        st.caption(hidden_caption.format(n=hidden_count))
+
     return edited_items, deleted_rid
+
+
+def _submit_grn_items(
+    key_prefix, items_key, status_key, items,
+    selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+):
+    """POSTs /confirm for a batch of (already-flag-free) GRN items and
+    updates status_key/confirm_results accordingly. Shared by SKIP REVIEW's
+    two submission paths: immediately after a clean parse, and once a
+    flagged batch has been fixed up.
+    """
+    if show_shop_selector and not selected_shop_id:
+        st.session_state[status_key] = "Select a shop first."
+        return
+    if show_supplier_selector and not selected_supplier_id:
+        st.session_state[status_key] = "Select a supplier first."
+        return
+
+    payload_items = [{k: v for k, v in it.items() if k != "_rid"} for it in items]
+    run_id = timing.new_run_id()
+    with timing.section(
+        "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
+    ):
+        try:
+            with st.spinner(f"Submitting {len(payload_items)} item(s)…"):
+                with timing.timed("http_post_confirm"):
+                    resp = requests.post(
+                        f"{BACKEND_URL}/confirm",
+                        json={
+                            "shop_id": selected_shop_id,
+                            "supplier_id": selected_supplier_id,
+                            "items": payload_items,
+                        },
+                        timeout=300,
+                    )
+            if resp.ok:
+                st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
+                st.session_state[items_key] = []
+                st.session_state[status_key] = f"Submitted GRN with {len(payload_items)} item(s)."
+                timing.log("confirm_result", results=len(payload_items))
+            else:
+                error = resp.json().get("error", resp.text)
+                st.session_state[status_key] = f"Submit failed: {error}"
+                timing.log("confirm_failed", error=error)
+        except Exception as e:
+            st.session_state[status_key] = f"Could not reach confirm backend at {BACKEND_URL}: {e}"
+            timing.log("confirm_exception", error=str(e))
+
+
+def _render_grn_skip_review(
+    key_prefix, mode, items_key, status_key, catalog_products,
+    selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+):
+    """GRN's SKIP REVIEW flow (SI_GRN_SKIP_REVIEW=true): no read-then-review
+    step — a single "Submit GRN" button parses the paste and, if every item
+    matched cleanly (exact or fuzzy), submits it right away. If anything
+    came back with no match at all, only those flagged rows are shown for
+    correction — the rest of the batch is trusted as-is — and submission is
+    blocked until every flag is fixed.
+    """
+    pending_items = st.session_state.get(items_key) or []
+
+    if pending_items:
+        product_lookup = _product_lookup(catalog_products or [])
+        edited_items, deleted_rid = _render_match_rows(
+            pending_items, key_prefix, "goods_received", "Qty", product_lookup,
+            compact=True, hide_statuses={"exact", "fuzzy"},
+        )
+        if deleted_rid is not None:
+            st.session_state[items_key] = [it for it in edited_items if it["_rid"] != deleted_rid]
+            st.rerun()
+        st.session_state[items_key] = edited_items
+
+        unmatched_count = sum(1 for e in edited_items if not e.get("matched_product_id"))
+        if st.button(
+            "Submit GRN", key=f"{key_prefix}_submit_btn", disabled=bool(unmatched_count),
+        ):
+            _submit_grn_items(
+                key_prefix, items_key, status_key, edited_items,
+                selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+            )
+            st.rerun()
+        return
+
+    paste_text = st.text_area(
+        "Paste WhatsApp message here",
+        key=f"{key_prefix}_paste_input",
+        placeholder="Paste WhatsApp message here",
+        label_visibility="collapsed",
+        height=150,
+    )
+
+    if st.button("Submit GRN", key=f"{key_prefix}_submit_btn") and paste_text:
+        run_id = timing.new_run_id()
+        with timing.section(
+            "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, paste_chars=len(paste_text),
+            paste_lines=len(paste_text.splitlines()),
+        ):
+            try:
+                with st.spinner("Processing — large pastes can take a minute or two…"):
+                    with timing.timed("http_post_parse"):
+                        resp = requests.post(
+                            f"{BACKEND_URL}/parse",
+                            json={"text": paste_text, "mode": mode},
+                            timeout=600,
+                        )
+                if resp.ok:
+                    new_items = _with_row_ids(resp.json()["items"])
+                    unmatched_count = sum(
+                        1 for it in new_items if not it.get("matched_product_id")
+                    )
+                    timing.log(
+                        "parse_result", items_added=len(new_items), unmatched=unmatched_count,
+                    )
+                    if unmatched_count:
+                        st.session_state[items_key] = new_items
+                        st.session_state[status_key] = (
+                            f"Processed {len(new_items)} item(s), "
+                            f"{unmatched_count}/{len(new_items)} item(s) are flagged — "
+                            "please fix before proceeding."
+                        )
+                    else:
+                        st.session_state[items_key] = []
+                        _submit_grn_items(
+                            key_prefix, items_key, status_key, new_items,
+                            selected_shop_id, selected_supplier_id,
+                            show_shop_selector, show_supplier_selector,
+                        )
+                else:
+                    error = resp.json().get("error", resp.text)
+                    st.session_state[status_key] = f"Couldn't process that: {error}"
+                    timing.log("parse_failed", error=error)
+            except Exception as e:
+                st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
+                timing.log("parse_exception", error=str(e))
+
+        st.rerun()
 
 
 def render_parse_tab(
@@ -278,9 +510,17 @@ def render_parse_tab(
                     supplier_options = {}
                     st.error(f"Could not load suppliers: {e}")
 
+                supplier_keys = list(supplier_options.keys()) or ["-"]
+                # "N/A" (no tracked supplier) covers the overwhelming
+                # majority of deliveries, so default to it instead of
+                # whatever happens to sort first.
+                default_supplier_index = (
+                    supplier_keys.index("N/A") if "N/A" in supplier_keys else 0
+                )
                 supplier_label = st.selectbox(
                     "Supplier",
-                    options=list(supplier_options.keys()) or ["-"],
+                    options=supplier_keys,
+                    index=default_supplier_index,
                     key=f"{key_prefix}_supplier",
                 )
                 selected_supplier_id = supplier_options.get(supplier_label)
@@ -297,175 +537,197 @@ def render_parse_tab(
         with st.container(border=True):
             st.write(st.session_state[status_key])
 
-    paste_text = st.text_area(
-        "Paste WhatsApp message here",
-        key=f"{key_prefix}_paste_input",
-        placeholder="Paste WhatsApp message here",
-        label_visibility="collapsed",
-        height=150,
-    )
+    skip_review = mode == "goods_received" and _env_flag("SI_GRN_SKIP_REVIEW")
 
-    if st.button("Read items", key=f"{key_prefix}_read_btn") and paste_text:
-        run_id = timing.new_run_id()
-        with timing.section(
-            "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, paste_chars=len(paste_text),
-            paste_lines=len(paste_text.splitlines()),
-        ):
-            try:
-                # A large paste (e.g. a full delivery's worth of GRN lines) can
-                # take a couple of minutes — each line goes through several
-                # agent tool calls. 90s was too short and produced a client-side
-                # timeout even though the backend was still working correctly
-                # (confirmed: 42 items completed in ~133s, all matched).
-                with st.spinner("Parsing — large pastes can take a minute or two…"):
-                    with timing.timed("http_post_parse"):
-                        resp = requests.post(
-                            f"{BACKEND_URL}/parse",
-                            json={"text": paste_text, "mode": mode},
-                            timeout=600,
-                        )
-                if resp.ok:
-                    new_items = _with_row_ids(resp.json()["items"])
-                    existing_items = st.session_state.get(items_key) or []
-                    st.session_state[items_key] = existing_items + new_items
-                    st.session_state[f"{key_prefix}_confirm_results"] = None
-                    st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
-                    timing.log("parse_result", items_added=len(new_items))
-                else:
-                    error = resp.json().get("error", resp.text)
-                    st.session_state[status_key] = f"Couldn't process that: {error}"
-                    timing.log("parse_failed", error=error)
-            except Exception as e:
-                st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
-                timing.log("parse_exception", error=str(e))
+    if skip_review:
+        _render_grn_skip_review(
+            key_prefix, mode, items_key, status_key, catalog_products,
+            selected_shop_id, selected_supplier_id,
+            show_shop_selector, show_supplier_selector,
+        )
+    else:
+        paste_text = st.text_area(
+            "Paste WhatsApp message here",
+            key=f"{key_prefix}_paste_input",
+            placeholder="Paste WhatsApp message here",
+            label_visibility="collapsed",
+            height=150,
+        )
 
-        st.rerun()
+        if st.button("Read items", key=f"{key_prefix}_read_btn") and paste_text:
+            run_id = timing.new_run_id()
+            with timing.section(
+                "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, paste_chars=len(paste_text),
+                paste_lines=len(paste_text.splitlines()),
+            ):
+                try:
+                    # A large paste (e.g. a full delivery's worth of GRN lines) can
+                    # take a couple of minutes — each line goes through several
+                    # agent tool calls. 90s was too short and produced a client-side
+                    # timeout even though the backend was still working correctly
+                    # (confirmed: 42 items completed in ~133s, all matched).
+                    with st.spinner("Parsing — large pastes can take a minute or two…"):
+                        with timing.timed("http_post_parse"):
+                            resp = requests.post(
+                                f"{BACKEND_URL}/parse",
+                                json={"text": paste_text, "mode": mode},
+                                timeout=600,
+                            )
+                    if resp.ok:
+                        new_items = _with_row_ids(resp.json()["items"])
+                        existing_items = st.session_state.get(items_key) or []
+                        st.session_state[items_key] = existing_items + new_items
+                        st.session_state[f"{key_prefix}_confirm_results"] = None
+                        st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
+                        timing.log("parse_result", items_added=len(new_items))
+                    else:
+                        error = resp.json().get("error", resp.text)
+                        st.session_state[status_key] = f"Couldn't process that: {error}"
+                        timing.log("parse_failed", error=error)
+                except Exception as e:
+                    st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
+                    timing.log("parse_exception", error=str(e))
 
-    items = st.session_state.get(items_key)
-
-    if items:
-        st.markdown("---")
-        st.markdown("**Review parsed items and fix anything before submitting:**")
-
-        edited_items = []
-        deleted_rid = None
-
-        if mode == "new_products":
-            widths = [1, 4.5, 1.1, 1.1, 0.5]
-            headers = ["Code", "Product name", "Price", "Initial stock", ""]
-
-            for col, header in zip(st.columns(widths), headers):
-                col.markdown(f"**{header}**")
-
-            for item in items:
-                rid = item["_rid"]
-                cols = st.columns(widths)
-                code = cols[0].text_input(
-                    "Code", value=item.get("code") or "",
-                    key=f"{key_prefix}_code_{rid}", label_visibility="collapsed",
-                )
-                name = cols[1].text_input(
-                    "Product name", value=item.get("name", ""),
-                    key=f"{key_prefix}_name_{rid}", label_visibility="collapsed",
-                )
-                price = cols[2].number_input(
-                    "Price", value=float((item.get("fields") or {}).get("price") or 0.0),
-                    min_value=0.0, step=0.01, format="%.2f",
-                    key=f"{key_prefix}_price_{rid}", label_visibility="collapsed",
-                )
-                quantity = cols[3].number_input(
-                    "Initial stock", value=int(item.get("quantity") or 0),
-                    step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
-                )
-                if cols[4].button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
-                    deleted_rid = rid
-                edited_items.append({
-                    "_rid": rid,
-                    "raw_text": item.get("raw_text", ""),
-                    "action": "new_product",
-                    "name": name,
-                    "code": code or None,
-                    "fields": {"price": price},
-                    "quantity": quantity,
-                    "matched_product_id": None,
-                    "candidates": [],
-                })
-
-        else:  # product_updates (stock_update) or goods_received: matched against the catalog
-            product_lookup = _product_lookup(catalog_products or [])
-
-            action = "goods_received" if mode == "goods_received" else "stock_update"
-            qty_label = "Qty" if mode == "goods_received" else "Qty / Δ"
-            edited_items, deleted_rid = _render_match_rows(
-                items, key_prefix, action, qty_label, product_lookup
-            )
-
-        if deleted_rid is not None:
-            st.session_state[items_key] = [it for it in edited_items if it["_rid"] != deleted_rid]
             st.rerun()
 
-        # Persist edits so a follow-up paste operates on the latest state.
-        st.session_state[items_key] = edited_items
+        items = st.session_state.get(items_key)
 
-        unmatched_count = sum(
-            1 for e in edited_items
-            if e["action"] in ("stock_update", "goods_received") and not e.get("matched_product_id")
-        )
-        if unmatched_count:
-            st.warning(
-                f"Fix {unmatched_count} unmatched item(s) before submitting — "
-                "select a product or delete the row."
-            )
+        if items:
+            st.markdown("---")
+            st.markdown("**Review parsed items and fix anything before submitting:**")
 
-        if st.button(
-            "Confirm and Submit", key=f"{key_prefix}_confirm_btn", disabled=bool(unmatched_count)
-        ):
-            missing_shop = show_shop_selector and not selected_shop_id and any(
-                e["action"] in ("stock_update", "goods_received") for e in edited_items
+            trust_mode = False
+            if mode == "goods_received":
+                trust_mode = st.checkbox(
+                    "Trust mode — only show flagged or non-exact matches",
+                    value=True, key=f"{key_prefix}_trust_mode",
+                )
+
+            edited_items = []
+            deleted_rid = None
+
+            if mode == "new_products":
+                widths = [1, 4.5, 1.1, 1.1, 0.5]
+                headers = ["Code", "Product name", "Price", "Initial stock", ""]
+
+                for col, header in zip(st.columns(widths), headers):
+                    col.markdown(f"**{header}**")
+
+                for item in items:
+                    rid = item["_rid"]
+                    cols = st.columns(widths)
+                    code = cols[0].text_input(
+                        "Code", value=item.get("code") or "",
+                        key=f"{key_prefix}_code_{rid}", label_visibility="collapsed",
+                    )
+                    name = cols[1].text_input(
+                        "Product name", value=item.get("name", ""),
+                        key=f"{key_prefix}_name_{rid}", label_visibility="collapsed",
+                    )
+                    price = cols[2].number_input(
+                        "Price", value=float((item.get("fields") or {}).get("price") or 0.0),
+                        min_value=0.0, step=0.01, format="%.2f",
+                        key=f"{key_prefix}_price_{rid}", label_visibility="collapsed",
+                    )
+                    quantity = cols[3].number_input(
+                        "Initial stock", value=int(item.get("quantity") or 0),
+                        step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
+                    )
+                    if cols[4].button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
+                        deleted_rid = rid
+                    edited_items.append({
+                        "_rid": rid,
+                        "raw_text": item.get("raw_text", ""),
+                        "action": "new_product",
+                        "name": name,
+                        "code": code or None,
+                        "fields": {"price": price},
+                        "quantity": quantity,
+                        "matched_product_id": None,
+                        "candidates": [],
+                    })
+
+            else:  # product_updates (stock_update) or goods_received: matched against the catalog
+                product_lookup = _product_lookup(catalog_products or [])
+
+                action = "goods_received" if mode == "goods_received" else "stock_update"
+                qty_label = "Qty" if mode == "goods_received" else "Qty / Δ"
+                edited_items, deleted_rid = _render_match_rows(
+                    items, key_prefix, action, qty_label, product_lookup,
+                    compact=(mode == "goods_received"),
+                    hide_statuses={"exact"} if trust_mode else frozenset(),
+                    hidden_caption=(
+                        "Trust mode: {n} exact match(es) hidden — turn it off to review everything."
+                        if trust_mode else None
+                    ),
+                )
+
+            if deleted_rid is not None:
+                st.session_state[items_key] = [it for it in edited_items if it["_rid"] != deleted_rid]
+                st.rerun()
+
+            # Persist edits so a follow-up paste operates on the latest state.
+            st.session_state[items_key] = edited_items
+
+            unmatched_count = sum(
+                1 for e in edited_items
+                if e["action"] in ("stock_update", "goods_received") and not e.get("matched_product_id")
             )
-            missing_supplier = show_supplier_selector and not selected_supplier_id and any(
-                e["action"] == "goods_received" for e in edited_items
-            )
-            if missing_shop:
-                st.warning("Select a shop first.")
-            elif missing_supplier:
-                st.warning("Select a supplier first.")
-            else:
-                payload_items = [{k: v for k, v in it.items() if k != "_rid"} for it in edited_items]
-                run_id = timing.new_run_id()
-                with timing.section(
-                    "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
-                ):
-                    try:
-                        with st.spinner("Submitting…"):
-                            with timing.timed("http_post_confirm"):
-                                resp = requests.post(
-                                    f"{BACKEND_URL}/confirm",
-                                    json={
-                                        "shop_id": selected_shop_id,
-                                        "supplier_id": selected_supplier_id,
-                                        "items": payload_items,
-                                    },
-                                    # stock_update does two HTTP calls per item
-                                    # (get_inventory + set_inventory), so a large
-                                    # batch can add up — same false-timeout risk
-                                    # as /parse.
-                                    timeout=300,
-                                )
-                        if resp.ok:
-                            st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
-                            # Clear so the next paste starts from empty rather than
-                            # appending onto items that were already submitted.
-                            st.session_state[items_key] = []
-                            timing.log("confirm_result", results=len(st.session_state[f"{key_prefix}_confirm_results"]))
-                            st.rerun()
-                        else:
-                            error = resp.json().get("error", resp.text)
-                            st.error(f"Confirm failed: {error}")
-                            timing.log("confirm_failed", error=error)
-                    except Exception as e:
-                        st.error(f"Could not reach confirm backend at {BACKEND_URL}: {e}")
-                        timing.log("confirm_exception", error=str(e))
+            if unmatched_count:
+                st.warning(
+                    f"Fix {unmatched_count} unmatched item(s) before submitting — "
+                    "select a product or delete the row."
+                )
+
+            if st.button(
+                "Confirm and Submit", key=f"{key_prefix}_confirm_btn", disabled=bool(unmatched_count)
+            ):
+                missing_shop = show_shop_selector and not selected_shop_id and any(
+                    e["action"] in ("stock_update", "goods_received") for e in edited_items
+                )
+                missing_supplier = show_supplier_selector and not selected_supplier_id and any(
+                    e["action"] == "goods_received" for e in edited_items
+                )
+                if missing_shop:
+                    st.warning("Select a shop first.")
+                elif missing_supplier:
+                    st.warning("Select a supplier first.")
+                else:
+                    payload_items = [{k: v for k, v in it.items() if k != "_rid"} for it in edited_items]
+                    run_id = timing.new_run_id()
+                    with timing.section(
+                        "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
+                    ):
+                        try:
+                            with st.spinner("Submitting…"):
+                                with timing.timed("http_post_confirm"):
+                                    resp = requests.post(
+                                        f"{BACKEND_URL}/confirm",
+                                        json={
+                                            "shop_id": selected_shop_id,
+                                            "supplier_id": selected_supplier_id,
+                                            "items": payload_items,
+                                        },
+                                        # stock_update does two HTTP calls per item
+                                        # (get_inventory + set_inventory), so a large
+                                        # batch can add up — same false-timeout risk
+                                        # as /parse.
+                                        timeout=300,
+                                    )
+                            if resp.ok:
+                                st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
+                                # Clear so the next paste starts from empty rather than
+                                # appending onto items that were already submitted.
+                                st.session_state[items_key] = []
+                                timing.log("confirm_result", results=len(st.session_state[f"{key_prefix}_confirm_results"]))
+                                st.rerun()
+                            else:
+                                error = resp.json().get("error", resp.text)
+                                st.error(f"Confirm failed: {error}")
+                                timing.log("confirm_failed", error=error)
+                        except Exception as e:
+                            st.error(f"Could not reach confirm backend at {BACKEND_URL}: {e}")
+                            timing.log("confirm_exception", error=str(e))
 
     results = st.session_state.get(f"{key_prefix}_confirm_results")
     if results:
