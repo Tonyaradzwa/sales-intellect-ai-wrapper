@@ -26,11 +26,13 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from datetime import date, datetime
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, create_sdk_mcp_server, query, tool
 from flask import Flask, jsonify, request
 
+import job_store
 import timing
 from client import SalesIntellectClient
 from lfu_cache import LFUCache
@@ -601,8 +603,7 @@ def _cache_match(name_query, matches):
         {"matched_product_id": m["matched_product_id"], "name": m.get("name", ""), "code": m.get("code")}
         for m in matched
     ]
-    existing = _lookup_cache.get(key) or []
-    _lookup_cache.put(key, existing + entries)
+    _lookup_cache.merge(key, entries)
 
 
 def _find_confident_fuzzy_matches(index, lines, action):
@@ -654,18 +655,71 @@ def _find_confident_fuzzy_matches(index, lines, action):
     return fuzzy_items, remaining_lines
 
 
-def _run_parse_agent(mode, text, index):
-    """Runs the Claude Agent SDK's built-in tool-call loop to turn `text` into items.
+def _resolve_fast_tiers(mode, text, index):
+    """Tiers 1-3 of parsing: exact catalog-name match, then the LFU lookup
+    cache, then a deterministic high-confidence fuzzy auto-match — each
+    tier only sees whatever the previous tier didn't resolve. Fast
+    (ms-scale per timings.log), so this always runs synchronously in the
+    request thread; only whatever's left after this (if anything) needs
+    the LLM agent, which can be slow and runs separately — see
+    _run_parse_agent_remainder().
 
-    For goods_received/product_updates, lines with an unambiguous exact
-    catalog-name match are resolved directly by _find_exact_matches() and
-    never reach the LLM; only the remaining lines are sent to the agent (if
-    none remain, the agent isn't invoked at all). Tools are scoped per
-    request: search_products (all modes), generate_next_product_code
-    (new_products only), and submit_result (schema depends on mode). The
-    agent calls submit_result once per line item; each call is captured
-    here and translated into our canonical item schema.
+    new_products has nothing in the catalog to match a brand-new product
+    against, so none of these tiers apply there — every line goes
+    straight to the agent, same as before this function existed.
+
+    Returns (resolved_items, remaining_lines) — remaining_lines is empty
+    only when every line was resolved by one of these tiers (possible for
+    goods_received/product_updates; never happens for new_products, given
+    non-empty input text).
     """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    if mode not in ("goods_received", "product_updates"):
+        return [], lines
+
+    with timing.timed("find_exact_matches", lines=len(lines)):
+        exact_items, remaining_lines = _find_exact_matches(index, lines)
+    timing.log(
+        "exact_match_result",
+        total_lines=len(lines), exact=len(exact_items), remaining=len(remaining_lines),
+    )
+    action = "goods_received" if mode == "goods_received" else "stock_update"
+    for item in exact_items:
+        item["action"] = action
+
+    cache_items = []
+    if remaining_lines:
+        with timing.timed("find_cached_matches", lines=len(remaining_lines)):
+            cache_items, remaining_lines = _find_cached_matches(remaining_lines, action)
+        timing.log("cache_match_result", hits=len(cache_items), remaining=len(remaining_lines))
+
+    fuzzy_items = []
+    if remaining_lines:
+        with timing.timed("find_confident_fuzzy_matches", lines=len(remaining_lines)):
+            fuzzy_items, remaining_lines = _find_confident_fuzzy_matches(index, remaining_lines, action)
+        timing.log("fuzzy_auto_match_result", auto_matched=len(fuzzy_items), remaining=len(remaining_lines))
+
+    if not remaining_lines:
+        timing.log("agent_skipped -- all lines resolved by exact/cache/fuzzy match")
+
+    return exact_items + cache_items + fuzzy_items, remaining_lines
+
+
+def _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items, progress_cb=lambda n: None):
+    """Runs the Claude Agent SDK's built-in tool-call loop on whatever
+    _resolve_fast_tiers() didn't resolve, turning `remaining_lines` into
+    items. Tools are scoped per request: search_products (all modes),
+    generate_next_product_code (new_products only), and submit_result
+    (schema depends on mode). The agent calls submit_result once per line
+    item; each call is captured here, translated into our canonical item
+    schema, and reported via progress_cb(done_count) so a caller (the
+    /parse route, via job_store) can expose real "N of M" progress —
+    defaults to a no-op so this function stays usable/testable standalone.
+
+    Returns resolved_items + whatever the agent produced.
+    """
+    text = "\n".join(remaining_lines)
     with timing.section("PARSE AGENT", mode=mode, input_chars=len(text)):
         collected_items = []
         used_codes = {p.get("code") for p in index.catalog if p.get("code")}
@@ -674,37 +728,6 @@ def _run_parse_agent(mode, text, index):
         def _record_call(name):
             tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
             return tool_call_counts[name]
-
-        exact_items = []
-        cache_items = []
-        fuzzy_items = []
-        if mode in ("goods_received", "product_updates"):
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            with timing.timed("find_exact_matches", lines=len(lines)):
-                exact_items, remaining_lines = _find_exact_matches(index, lines)
-            timing.log(
-                "exact_match_result",
-                total_lines=len(lines), exact=len(exact_items), remaining=len(remaining_lines),
-            )
-            action = "goods_received" if mode == "goods_received" else "stock_update"
-            for item in exact_items:
-                item["action"] = action
-
-            if remaining_lines:
-                with timing.timed("find_cached_matches", lines=len(remaining_lines)):
-                    cache_items, remaining_lines = _find_cached_matches(remaining_lines, action)
-                timing.log("cache_match_result", hits=len(cache_items), remaining=len(remaining_lines))
-
-            if remaining_lines:
-                with timing.timed("find_confident_fuzzy_matches", lines=len(remaining_lines)):
-                    fuzzy_items, remaining_lines = _find_confident_fuzzy_matches(index, remaining_lines, action)
-                timing.log("fuzzy_auto_match_result", auto_matched=len(fuzzy_items), remaining=len(remaining_lines))
-
-            if not remaining_lines:
-                timing.log("agent_skipped -- all lines resolved by exact/cache/fuzzy match")
-                return exact_items + cache_items + fuzzy_items
-
-            text = "\n".join(remaining_lines)
 
         # Accumulates search_products results since the last submit_result call,
         # so submit_result can reuse them as `candidates` instead of re-searching.
@@ -773,6 +796,7 @@ def _run_parse_agent(mode, text, index):
                         "code": args.get("suggested_product_code"),
                         "exact_match": False,
                     })
+                    progress_cb(len(resolved_items) + len(collected_items))
                 return {"content": [{"type": "text", "text": "Recorded."}]}
 
             tools.append(submit_result)
@@ -819,6 +843,7 @@ def _run_parse_agent(mode, text, index):
                         "code": matched["code"] if matched else None,
                         "exact_match": False,
                     })
+                    progress_cb(len(resolved_items) + len(collected_items))
                     _cache_match(
                         _split_trailing_quantity(args["raw_text"])["name_query"],
                         [collected_items[-1]],
@@ -869,6 +894,7 @@ def _run_parse_agent(mode, text, index):
                         "code": matched["code"] if matched else None,
                         "exact_match": False,
                     })
+                    progress_cb(len(resolved_items) + len(collected_items))
                     _cache_match(
                         _split_trailing_quantity(args["raw_text"])["name_query"],
                         [collected_items[-1]],
@@ -907,7 +933,21 @@ def _run_parse_agent(mode, text, index):
             by_tool=tool_call_counts,
             items_collected=len(collected_items),
         )
-        return exact_items + cache_items + fuzzy_items + collected_items
+        return resolved_items + collected_items
+
+
+def _run_parse_agent(mode, text, index):
+    """Convenience wrapper combining _resolve_fast_tiers() + (if anything
+    remains) _run_parse_agent_remainder() into the single synchronous call
+    this used to be before the /parse route needed to run the remainder in
+    a background thread for progress reporting. Kept for callers (and
+    tests) that just want the complete result in one call, with no
+    progress tracking.
+    """
+    resolved_items, remaining_lines = _resolve_fast_tiers(mode, text, index)
+    if not remaining_lines:
+        return resolved_items
+    return _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items)
 
 
 @app.route("/parse", methods=["POST"])
@@ -941,17 +981,65 @@ def parse():
         timing.log("catalog_index_ready", catalog_size=len(catalog), fetched_at=fetched_at)
 
         try:
-            items = _run_parse_agent(mode, text, index)
+            with timing.timed("resolve_fast_tiers"):
+                resolved_items, remaining_lines = _resolve_fast_tiers(mode, text, index)
         except Exception as e:
-            timing.log("agent_run_failed", error=str(e))
+            timing.log("resolve_fast_tiers_failed", error=str(e))
             return jsonify({"error": f"Agent run failed: {e}"}), 502
 
-        with timing.timed("assign_codes"):
-            items = _assign_codes(items, catalog, reserve_existing_item_codes=True)
+        if not remaining_lines:
+            # Everything resolved by the fast tiers — respond exactly as
+            # before this job-based path existed (no job_id key), so
+            # existing frontend callers/tests that only know this shape
+            # keep working unmodified.
+            with timing.timed("assign_codes"):
+                items = _assign_codes(resolved_items, catalog, reserve_existing_item_codes=True)
+            timing.log("PARSE REQUEST RESULT", items_returned=len(items))
+            return jsonify({"items": items})
 
-        timing.log("PARSE REQUEST RESULT", items_returned=len(items))
+        # Something needs the (potentially slow) LLM agent — hand it off to
+        # a background thread and respond immediately with a job_id the
+        # frontend polls via GET /job/status/<job_id>, instead of blocking
+        # this request/gunicorn worker for however long the agent takes.
+        job_store.cleanup_stale_jobs()
+        job_id = uuid.uuid4().hex
+        total = len(resolved_items) + len(remaining_lines)
+        job_store.create_job(job_id, total=total, kind="parse", done=len(resolved_items))
+        timing.log("parse_job_created", job_id=job_id, total=total, resolved_so_far=len(resolved_items))
 
-    return jsonify({"items": items})
+        def progress_cb(n):
+            job_store.update_job(job_id, done=n)
+
+        def _background():
+            bg_run_id = timing.new_run_id()
+            with timing.section("PARSE AGENT BACKGROUND", run_id=bg_run_id, job_id=job_id):
+                try:
+                    items = _run_parse_agent_remainder(
+                        mode, remaining_lines, index, resolved_items, progress_cb,
+                    )
+                    items = _assign_codes(items, catalog, reserve_existing_item_codes=True)
+                    job_store.update_job(job_id, status="done", items=items, done=len(items))
+                    timing.log("parse_job_done", job_id=job_id, items_returned=len(items))
+                except Exception as e:
+                    timing.log("parse_job_failed", job_id=job_id, error=str(e))
+                    job_store.update_job(job_id, status="error", error=str(e))
+
+        threading.Thread(target=_background, daemon=True).start()
+        timing.log("PARSE REQUEST RESULT (job spawned)", job_id=job_id, total=total)
+
+    return jsonify({"job_id": job_id, "total": total, "done": len(resolved_items)}), 202
+
+
+@app.route("/job/status/<job_id>", methods=["GET"])
+def job_status(job_id):
+    """Polled by the frontend while a /parse or /confirm job runs in the
+    background (see job_store.py) — reports real progress (file-backed, so
+    it's correct regardless of which gunicorn worker process handles this
+    particular GET vs. which worker is running the job's own thread)."""
+    job = job_store.read_job(job_id)
+    if job is None:
+        return jsonify({"error": "Unknown or expired job."}), 404
+    return jsonify(job)
 
 
 @app.route("/catalog", methods=["GET"])
@@ -994,6 +1082,71 @@ def refresh_catalog_route():
     return jsonify({"products": products, "fetched_at": fetched_at, "count": len(products)})
 
 
+def _process_other_item(item, shop_id, shop_name):
+    """Writes one stock_update/new_product item to Sales Intellect and
+    returns its results-list entry (success, or a staff-facing failure
+    message). Extracted from the /confirm route's per-item loop so the
+    exact same logic runs whether that loop executes synchronously or
+    inside a background job thread (see confirm() below).
+    """
+    action = item.get("action")
+    raw_text = item.get("raw_text", "")
+    name = item.get("name") or raw_text
+    with timing.timed(f"item:{action}", name=name):
+        try:
+            if action == "new_product":
+                # Re-fetch fresh right before writing, in case another
+                # submission took this code (or a lower one) in the meantime.
+                fresh_catalog = _trimmed_catalog(si_client.list_products())
+                fresh_codes = {c["code"] for c in fresh_catalog if c.get("code")}
+
+                code = item.get("code")
+                if not code or code in fresh_codes:
+                    code = _suggest_next_code(fresh_codes)
+
+                payload = {
+                    "product_name": _normalize_new_product_name(item.get("name")),
+                    # The API 400s if these booleans are omitted entirely (they
+                    # come back null and fail its "must be a boolean" check) —
+                    # these are reasonable defaults for a simple, non-variant,
+                    # stock-tracked product.
+                    "stock_control": True,
+                    "product_price_change": True,
+                    "qty_change_option": True,
+                    "expire_mode": False,
+                    "is_composite": False,
+                    "use_production": False,
+                    "is_variant": False,
+                }
+                if code:
+                    payload["product_code"] = code
+                price = (item.get("fields") or {}).get("price")
+                if price is not None:
+                    payload["cost"] = price
+                result = si_client.upsert_product(payload)
+            elif action == "stock_update":
+                product_id = item.get("matched_product_id")
+                quantity = item.get("quantity")
+                if not product_id:
+                    raise Exception("No matched_product_id set for stock update.")
+                if quantity is None:
+                    raise Exception("No quantity set for stock update.")
+                result = si_client.adjust_inventory(shop_id, product_id, int(quantity))
+            else:
+                raise Exception(f"Unknown action: {action!r}")
+
+            return {"raw_text": raw_text, "name": name, "success": True, "result": result}
+        except Exception as e:
+            # Full detail (product_id, shop_id, API response) goes to the
+            # server log only — staff shouldn't see internal ids.
+            app.logger.exception(f"Confirm failed for action={action!r} raw_text={raw_text!r}")
+            if action == "stock_update":
+                error = f"Could not update inventory for {name} at {shop_name or 'this shop'}."
+            else:
+                error = str(e)
+            return {"raw_text": raw_text, "name": name, "success": False, "error": error}
+
+
 @app.route("/confirm", methods=["POST"])
 def confirm():
     if si_client is None:
@@ -1023,86 +1176,56 @@ def confirm():
                 except Exception:
                     pass  # Falls back to "this shop" in error messages below; not worth failing the whole confirm over.
 
-        results = []
         grn_items = [item for item in items if item.get("action") == "goods_received"]
         other_items = [item for item in items if item.get("action") != "goods_received"]
         timing.log("split_items", grn_items=len(grn_items), other_items=len(other_items))
 
-        if other_items:
-            with timing.section("SUBMITTING RESULTS", count=len(other_items)):
-                for item in other_items:
-                    action = item.get("action")
-                    raw_text = item.get("raw_text", "")
-                    name = item.get("name") or raw_text
-                    with timing.timed(f"item:{action}", name=name):
-                        try:
-                            if action == "new_product":
-                                # Re-fetch fresh right before writing, in case another
-                                # submission took this code (or a lower one) in the meantime.
-                                fresh_catalog = _trimmed_catalog(si_client.list_products())
-                                fresh_codes = {c["code"] for c in fresh_catalog if c.get("code")}
+        if not other_items:
+            # GRN-only submission: _submit_grn makes one batch API call, no
+            # per-item loop, so there's nothing to report incremental
+            # progress on. Stay synchronous and respond exactly as before
+            # this job-based path existed (no job_id key), so existing
+            # frontend callers/tests that only know this shape keep working.
+            results = []
+            if grn_items:
+                with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
+                    results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name))
+            return jsonify({"results": results})
 
-                                code = item.get("code")
-                                if not code or code in fresh_codes:
-                                    code = _suggest_next_code(fresh_codes)
+        # other_items has a real per-item server-side loop (each one is a
+        # separate API call) — hand off to a background thread with real
+        # progress, same job_store mechanism /parse uses.
+        job_store.cleanup_stale_jobs()
+        job_id = uuid.uuid4().hex
+        total = len(other_items) + (1 if grn_items else 0)
+        job_store.create_job(job_id, total=total, kind="confirm", done=0)
+        timing.log("confirm_job_created", job_id=job_id, total=total)
 
-                                payload = {
-                                    "product_name": _normalize_new_product_name(item.get("name")),
-                                    # The API 400s if these booleans are omitted entirely (they
-                                    # come back null and fail its "must be a boolean" check) —
-                                    # these are reasonable defaults for a simple, non-variant,
-                                    # stock-tracked product.
-                                    "stock_control": True,
-                                    "product_price_change": True,
-                                    "qty_change_option": True,
-                                    "expire_mode": False,
-                                    "is_composite": False,
-                                    "use_production": False,
-                                    "is_variant": False,
-                                }
-                                if code:
-                                    payload["product_code"] = code
-                                price = (item.get("fields") or {}).get("price")
-                                if price is not None:
-                                    payload["cost"] = price
-                                result = si_client.upsert_product(payload)
-                            elif action == "stock_update":
-                                product_id = item.get("matched_product_id")
-                                quantity = item.get("quantity")
-                                if not product_id:
-                                    raise Exception("No matched_product_id set for stock update.")
-                                if quantity is None:
-                                    raise Exception("No quantity set for stock update.")
-                                result = si_client.adjust_inventory(shop_id, product_id, int(quantity))
-                            else:
-                                raise Exception(f"Unknown action: {action!r}")
+        def _background():
+            bg_run_id = timing.new_run_id()
+            with timing.section("CONFIRM BACKGROUND", run_id=bg_run_id, job_id=job_id):
+                results = []
+                try:
+                    with timing.section("SUBMITTING RESULTS", count=len(other_items)):
+                        for i, item in enumerate(other_items, start=1):
+                            results.append(_process_other_item(item, shop_id, shop_name))
+                            job_store.update_job(job_id, done=i)
 
-                            results.append({
-                                "raw_text": raw_text,
-                                "name": name,
-                                "success": True,
-                                "result": result,
-                            })
-                        except Exception as e:
-                            # Full detail (product_id, shop_id, API response) goes to the
-                            # server log only — staff shouldn't see internal ids.
-                            app.logger.exception(f"Confirm failed for action={action!r} raw_text={raw_text!r}")
-                            if action == "stock_update":
-                                error = f"Could not update inventory for {name} at {shop_name or 'this shop'}."
-                            else:
-                                error = str(e)
-                            results.append({
-                                "raw_text": raw_text,
-                                "name": name,
-                                "success": False,
-                                "error": error,
-                            })
+                    if grn_items:
+                        with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
+                            results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name))
+                        job_store.update_job(job_id, done=total)
 
-        if grn_items:
-            with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
-                results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name))
+                    job_store.update_job(job_id, status="done", results=results)
+                    timing.log("confirm_job_done", job_id=job_id, results=len(results))
+                except Exception as e:
+                    timing.log("confirm_job_failed", job_id=job_id, error=str(e))
+                    job_store.update_job(job_id, status="error", error=str(e), results=results)
 
-    return jsonify({"results": results})
+        threading.Thread(target=_background, daemon=True).start()
+        timing.log("CONFIRM REQUEST RESULT (job spawned)", job_id=job_id, total=total)
+
+    return jsonify({"job_id": job_id, "total": total, "done": 0}), 202
 
 
 def _verify_github_signature(secret, payload_body, signature_header):

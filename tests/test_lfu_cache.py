@@ -1,6 +1,7 @@
 """Unit tests for the LFUCache used as the server's tier-1 lookup cache."""
 
 import sys
+import threading
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -77,3 +78,50 @@ def test_clear_empties_cache():
 
     assert len(cache) == 0
     assert cache.get("a") is None
+
+
+def test_merge_combines_existing_and_new_entries():
+    cache = LFUCache(10)
+    cache.put("k", [1, 2])
+    cache.merge("k", [3, 4])
+    assert cache.get("k") == [1, 2, 3, 4]
+
+
+def test_merge_on_missing_key_acts_like_put():
+    cache = LFUCache(10)
+    cache.merge("k", [1])
+    assert cache.get("k") == [1]
+
+
+def test_concurrent_put_get_merge_does_not_corrupt_cache():
+    """Regression test for server.py now running parse work in background
+    threads (one per in-flight GRN paste), which means concurrent access to
+    this per-process cache is a real scenario, not a theoretical one — this
+    hammers put/get/merge from many threads and asserts the cache survives
+    (no exception, no size overrun), without asserting exact contents since
+    concurrent writes to overlapping keys don't have one "correct" outcome.
+    """
+    cache = LFUCache(20)
+    errors = []
+
+    def worker(n):
+        try:
+            for i in range(200):
+                key = f"k{i % 25}"
+                if n % 3 == 0:
+                    cache.put(key, [n, i])
+                elif n % 3 == 1:
+                    cache.merge(key, [n, i])
+                else:
+                    cache.get(key)
+        except Exception as e:  # pragma: no cover - failure path
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert len(cache) <= 20

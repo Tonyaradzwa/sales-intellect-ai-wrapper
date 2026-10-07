@@ -8,11 +8,13 @@ Run with:
 """
 
 import os
+import time
 import uuid
 
 import requests
 import streamlit as st
 
+import loading_ui
 import timing
 from client import SalesIntellectClient
 
@@ -133,6 +135,24 @@ def _product_lookup(products):
     return lookup
 
 
+def _session_cached(session_key, fetch_fn, spinner_message):
+    """Fetches via fetch_fn() once per browser session and caches the
+    result in st.session_state — no TTL. Without this, shops/suppliers/
+    catalog data gets refetched on every single Streamlit rerun (the whole
+    script re-runs on every interaction), which was costing ~3s on every
+    click before this existed. Cleared only by an explicit "Refresh ..."
+    action elsewhere (see the "Refresh Catalog"/"Refresh Suppliers"
+    buttons below). On failure, nothing is cached — a transient error
+    doesn't lock in a missing value for the rest of the session.
+    """
+    if session_key in st.session_state:
+        return st.session_state[session_key]
+    with st.spinner(spinner_message):
+        value = fetch_fn()
+    st.session_state[session_key] = value
+    return value
+
+
 def _fetch_catalog():
     """Fetches the shared, backend-cached product catalog. Normally served
     from the backend's in-memory/file cache (fast), but when there's no
@@ -153,10 +173,13 @@ def _with_row_ids(items):
 
 # Match-status -> (background tint, left-border accent) for the color-coded
 # name field in compact mode. Transparent backgrounds so text stays readable
-# in both light and dark themes.
+# in both light and dark themes. Only unmatched gets highlighted — a
+# "non-exact but matched" (fuzzy) state used to get a yellow highlight too,
+# but that turned out not to be useful in practice: once staff pick a
+# product for a flagged row, it's resolved and doesn't need to keep
+# standing out, so fuzzy rows render with no special styling at all.
 _MATCH_STATUS_STYLE = {
     "exact": ("rgba(34, 197, 94, 0.16)", "#22c55e"),
-    "fuzzy": ("rgba(234, 179, 8, 0.18)", "#eab308"),
     "unmatched": ("rgba(239, 68, 68, 0.16)", "#ef4444"),
 }
 
@@ -172,7 +195,9 @@ def _render_match_rows(
     compact: GRN's simplified layout — no separate Code column (the product
     name option already shows "Name (CODE)") and no separate Flag column;
     instead the name field itself is color-coded (green = exact match,
-    yellow = matched but not exact, red = unmatched) via _MATCH_STATUS_STYLE.
+    red = unmatched; a fuzzy/non-exact match gets no highlight — once
+    staff have picked a product it's resolved, nothing more to flag) via
+    _MATCH_STATUS_STYLE.
 
     hide_statuses (compact only): statuses ("exact", "fuzzy", "unmatched")
     to skip rendering entirely — those items are passed through unchanged,
@@ -278,9 +303,8 @@ def _render_match_rows(
         if compact:
             if status == "unmatched":
                 name_cell.caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
-            elif status == "fuzzy":
-                name_cell.caption("Not an exact match — please confirm")
-            row_styles.append((name_cell_key, status))
+            if status in _MATCH_STATUS_STYLE:
+                row_styles.append((name_cell_key, status))
 
         qty_col = cols[1] if compact else cols[2]
         qty = qty_col.number_input(
@@ -326,14 +350,29 @@ def _render_match_rows(
     return edited_items, deleted_rid
 
 
-def _submit_grn_items(
+def _submit_items(
     key_prefix, items_key, status_key, items,
     selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+    label="item",
 ):
-    """POSTs /confirm for a batch of (already-flag-free) GRN items and
-    updates status_key/confirm_results accordingly. Shared by SKIP REVIEW's
-    two submission paths: immediately after a clean parse, and once a
-    flagged batch has been fixed up.
+    """POSTs /confirm for a batch of (already-flag-free) items and updates
+    status_key/confirm_results accordingly. Shared by every Confirm/Submit
+    button across all tabs and flows — GRN's SKIP REVIEW (both submission
+    paths: immediately after a clean parse, and once a flagged batch has
+    been fixed up) and the classic read-then-review flow's Confirm and
+    Submit — so they can't drift apart again.
+
+    Response shapes from POST /confirm (see server.py):
+    - {"results": [...]}: a single batch API call (GRN's goods_received)
+      already finished by the time this response came back — the overlay
+      the caller wraps this call in covers the whole wait, no further
+      polling needed.
+    - {"job_id": ..., "total": ...}: a real per-item server-side loop
+      (stock_update/new_product) is running in the background — poll
+      GET /job/status/<job_id> and drive a real progress bar with it.
+
+    label: what to call these items in the status/toast message, e.g.
+    "GRN" -> "Submitted GRN with 12 item(s)."
     """
     if show_shop_selector and not selected_shop_id:
         st.session_state[status_key] = "Select a shop first."
@@ -348,7 +387,7 @@ def _submit_grn_items(
         "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
     ):
         try:
-            with st.spinner(f"Submitting {len(payload_items)} item(s)…"):
+            with loading_ui.overlay(f"Saving {len(payload_items)} item(s) to Sales Intellect…"):
                 with timing.timed("http_post_confirm"):
                     resp = requests.post(
                         f"{BACKEND_URL}/confirm",
@@ -357,20 +396,189 @@ def _submit_grn_items(
                             "supplier_id": selected_supplier_id,
                             "items": payload_items,
                         },
-                        timeout=300,
+                        timeout=30,
                     )
-            if resp.ok:
-                st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
-                st.session_state[items_key] = []
-                st.session_state[status_key] = f"Submitted GRN with {len(payload_items)} item(s)."
-                timing.log("confirm_result", results=len(payload_items))
-            else:
-                error = resp.json().get("error", resp.text)
-                st.session_state[status_key] = f"Submit failed: {error}"
-                timing.log("confirm_failed", error=error)
         except Exception as e:
-            st.session_state[status_key] = f"Could not reach confirm backend at {BACKEND_URL}: {e}"
+            st.session_state[status_key] = (
+                f"Could not reach confirm backend at {BACKEND_URL}: {e}. "
+                "Check your connection and try again."
+            )
             timing.log("confirm_exception", error=str(e))
+            return
+
+        if not resp.ok:
+            error = resp.json().get("error", resp.text)
+            st.session_state[status_key] = f"Submit failed: {error}. Check the items and try again."
+            timing.log("confirm_failed", error=error)
+            return
+
+        data = resp.json()
+
+        if "job_id" not in data:
+            # Single batch call (GRN) — already fully resolved.
+            results = data["results"]
+            timing.log("confirm_result", results=len(results))
+        else:
+            job_id = data["job_id"]
+            total = data.get("total", 0)
+            progress_box = st.empty()
+            loading_ui.render_progress(progress_box, 0, f"Updating 0 of {total}…")
+            deadline = time.time() + 300  # matches the old client-side timeout
+            job = None
+            while time.time() < deadline:
+                try:
+                    poll_resp = requests.get(f"{BACKEND_URL}/job/status/{job_id}", timeout=10)
+                    poll_resp.raise_for_status()
+                    job = poll_resp.json()
+                except Exception as e:
+                    timing.log("confirm_poll_exception", error=str(e))
+                    time.sleep(1.5)
+                    continue
+
+                done = job.get("done", 0)
+                loading_ui.render_progress(
+                    progress_box, done / total if total else 0, f"Updating {done} of {total}…",
+                )
+                if job.get("status") in ("done", "error"):
+                    break
+                time.sleep(1.5)
+            progress_box.empty()
+
+            if job is None or job.get("status") not in ("done", "error"):
+                st.session_state[status_key] = (
+                    "This is taking longer than expected. The update may still be "
+                    "processing on the server — wait a minute, then check the results below."
+                )
+                timing.log("confirm_poll_timeout", job_id=job_id)
+                return
+            if job.get("status") == "error":
+                st.session_state[status_key] = (
+                    f"Submit failed: {job.get('error')}. Check the items and try again."
+                )
+                timing.log("confirm_job_error", job_id=job_id, error=job.get("error"))
+                return
+            results = job.get("results", [])
+            timing.log("confirm_result", results=len(results))
+
+        st.session_state[f"{key_prefix}_confirm_results"] = results
+        st.session_state[items_key] = []
+        message = f"Submitted {label} with {len(payload_items)} item(s)."
+        st.session_state[status_key] = message
+        st.toast(message)
+
+
+def _run_parse_flow(mode, text):
+    """POSTs /parse and drives a real st.status + progress UI for the
+    result — polling GET /job/status/<job_id> if the backend hands off to
+    a background job for anything needing the LLM agent (see server.py's
+    /parse route). Shared by both the classic flow's "Read items" button
+    and SKIP REVIEW's "Submit GRN" first click, so they can't drift apart.
+
+    Returns (items, error_message) — exactly one of the two is falsy.
+    """
+    run_id = timing.new_run_id()
+    with timing.section(
+        "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, text_chars=len(text),
+        text_lines=len(text.splitlines()),
+    ):
+        try:
+            with timing.timed("http_post_parse"):
+                resp = requests.post(
+                    f"{BACKEND_URL}/parse",
+                    json={"text": text, "mode": mode},
+                    # The heavy work now runs server-side in a background
+                    # thread (see server.py) — this call just kicks it off
+                    # (or, for a fully-resolved paste, returns the result
+                    # directly), so it should return quickly either way.
+                    timeout=30,
+                )
+        except Exception as e:
+            timing.log("parse_exception", error=str(e))
+            return None, f"Could not reach backend at {BACKEND_URL}: {e}"
+
+        if not resp.ok:
+            error = resp.json().get("error", resp.text)
+            timing.log("parse_failed", error=error)
+            return None, f"Couldn't process that: {error}"
+
+        data = resp.json()
+
+        if "job_id" not in data:
+            # Everything resolved by the fast tiers — nothing to poll.
+            items = data["items"]
+            timing.log("parse_result", items_added=len(items))
+            exact_count = sum(1 for it in items if it.get("exact_match"))
+            st.status(
+                f"{len(items)} item(s): {exact_count} exact match(es), "
+                f"{len(items) - exact_count} need review",
+                state="complete", expanded=False,
+            )
+            return items, None
+
+        job_id = data["job_id"]
+        total = data.get("total", 0)
+        # The fast tiers (exact/cache/fuzzy match) already resolved
+        # `already_resolved` of these essentially instantly — reporting
+        # progress against the *full* total makes the bar jump straight to
+        # e.g. 49/56 then sit frozen there for the entire real wait, since
+        # only the remainder actually takes any time. Scope the bar to just
+        # that remainder instead, so each real tick is a much bigger (and
+        # more honest-looking) step.
+        already_resolved = data.get("done") or 0
+        remaining_total = max(1, total - already_resolved)
+
+        status = st.status("Reading your list…", expanded=True)
+        with status:
+            if already_resolved:
+                st.write(f"✓ Matched {already_resolved} of {total} item(s) instantly")
+            progress_box = st.empty()
+            loading_ui.render_progress(
+                progress_box, 0, f"Resolving 0 of {remaining_total} remaining item(s)…",
+            )
+
+        deadline = time.time() + 600  # matches the old client-side timeout
+        job = None
+        while time.time() < deadline:
+            try:
+                poll_resp = requests.get(f"{BACKEND_URL}/job/status/{job_id}", timeout=10)
+                poll_resp.raise_for_status()
+                job = poll_resp.json()
+            except Exception as e:
+                timing.log("parse_poll_exception", error=str(e))
+                time.sleep(1.5)
+                continue
+
+            remaining_done = max(0, job.get("done", 0) - already_resolved)
+            loading_ui.render_progress(
+                progress_box, remaining_done / remaining_total,
+                f"Resolving {remaining_done} of {remaining_total} remaining item(s)…",
+            )
+            if job.get("status") in ("done", "error"):
+                break
+            time.sleep(1.5)
+
+        if job is None or job.get("status") not in ("done", "error"):
+            status.update(label="This is taking longer than expected", state="error", expanded=True)
+            timing.log("parse_poll_timeout", job_id=job_id)
+            return None, (
+                "The list may still be processing on the server. Wait a minute and "
+                "try refreshing, or submit a shorter list."
+            )
+
+        if job.get("status") == "error":
+            status.update(label="Couldn't finish parsing that list", state="error", expanded=True)
+            timing.log("parse_job_error", job_id=job_id, error=job.get("error"))
+            return None, job.get("error") or "Something went wrong while matching your list to the catalog."
+
+        items = job.get("items", [])
+        exact_count = sum(1 for it in items if it.get("exact_match"))
+        status.update(
+            label=f"{len(items)} item(s): {exact_count} exact match(es), "
+                  f"{len(items) - exact_count} need review",
+            state="complete", expanded=False,
+        )
+        timing.log("parse_result", items_added=len(items))
+        return items, None
 
 
 def _render_grn_skip_review(
@@ -385,8 +593,23 @@ def _render_grn_skip_review(
     blocked until every flag is fixed.
     """
     pending_items = st.session_state.get(items_key) or []
+    submit_busy_key = f"{key_prefix}_submit"
+    submit_busy = loading_ui.is_busy(submit_busy_key)
 
     if pending_items:
+        if submit_busy:
+            # Replaces the correction table entirely while submitting —
+            # nothing clickable on screen, and no risk of re-deriving a
+            # different edited_items from the same widget keys mid-submit.
+            _submit_items(
+                key_prefix, items_key, status_key, loading_ui.busy_payload(submit_busy_key, "items"),
+                selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+                label="GRN",
+            )
+            loading_ui.clear_busy(submit_busy_key, "items")
+            st.rerun()
+            return
+
         product_lookup = _product_lookup(catalog_products or [])
         edited_items, deleted_rid = _render_match_rows(
             pending_items, key_prefix, "goods_received", "Qty", product_lookup,
@@ -401,11 +624,36 @@ def _render_grn_skip_review(
         if st.button(
             "Submit GRN", key=f"{key_prefix}_submit_btn", disabled=bool(unmatched_count),
         ):
-            _submit_grn_items(
-                key_prefix, items_key, status_key, edited_items,
-                selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
-            )
+            loading_ui.start_busy(submit_busy_key, items=edited_items)
             st.rerun()
+        return
+
+    if submit_busy:
+        # Replaces the paste box + button entirely while parsing/submitting.
+        text = loading_ui.busy_payload(submit_busy_key, "paste_text")
+        new_items, error = _run_parse_flow(mode, text)
+        if error is not None:
+            st.session_state[status_key] = f"Couldn't process that: {error}"
+        else:
+            new_items = _with_row_ids(new_items)
+            unmatched_count = sum(1 for it in new_items if not it.get("matched_product_id"))
+            if unmatched_count:
+                st.session_state[items_key] = new_items
+                st.session_state[status_key] = (
+                    f"Processed {len(new_items)} item(s), "
+                    f"{unmatched_count}/{len(new_items)} item(s) are flagged — "
+                    "please fix before proceeding."
+                )
+            else:
+                st.session_state[items_key] = []
+                _submit_items(
+                    key_prefix, items_key, status_key, new_items,
+                    selected_shop_id, selected_supplier_id,
+                    show_shop_selector, show_supplier_selector,
+                    label="GRN",
+                )
+        loading_ui.clear_busy(submit_busy_key, "paste_text")
+        st.rerun()
         return
 
     paste_text = st.text_area(
@@ -417,49 +665,7 @@ def _render_grn_skip_review(
     )
 
     if st.button("Submit GRN", key=f"{key_prefix}_submit_btn") and paste_text:
-        run_id = timing.new_run_id()
-        with timing.section(
-            "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, paste_chars=len(paste_text),
-            paste_lines=len(paste_text.splitlines()),
-        ):
-            try:
-                with st.spinner("Processing — large pastes can take a minute or two…"):
-                    with timing.timed("http_post_parse"):
-                        resp = requests.post(
-                            f"{BACKEND_URL}/parse",
-                            json={"text": paste_text, "mode": mode},
-                            timeout=600,
-                        )
-                if resp.ok:
-                    new_items = _with_row_ids(resp.json()["items"])
-                    unmatched_count = sum(
-                        1 for it in new_items if not it.get("matched_product_id")
-                    )
-                    timing.log(
-                        "parse_result", items_added=len(new_items), unmatched=unmatched_count,
-                    )
-                    if unmatched_count:
-                        st.session_state[items_key] = new_items
-                        st.session_state[status_key] = (
-                            f"Processed {len(new_items)} item(s), "
-                            f"{unmatched_count}/{len(new_items)} item(s) are flagged — "
-                            "please fix before proceeding."
-                        )
-                    else:
-                        st.session_state[items_key] = []
-                        _submit_grn_items(
-                            key_prefix, items_key, status_key, new_items,
-                            selected_shop_id, selected_supplier_id,
-                            show_shop_selector, show_supplier_selector,
-                        )
-                else:
-                    error = resp.json().get("error", resp.text)
-                    st.session_state[status_key] = f"Couldn't process that: {error}"
-                    timing.log("parse_failed", error=error)
-            except Exception as e:
-                st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
-                timing.log("parse_exception", error=str(e))
-
+        loading_ui.start_busy(submit_busy_key, paste_text=paste_text)
         st.rerun()
 
 
@@ -490,7 +696,9 @@ def render_parse_tab(
         if show_shop_selector:
             with selector_cols[0]:
                 try:
-                    shop_options = _shop_options(client.list_shops())
+                    shop_options = _shop_options(
+                        _session_cached("_cache_shops", client.list_shops, "Loading shop list…")
+                    )
                 except Exception as e:
                     shop_options = {}
                     st.error(f"Could not load shops: {e}")
@@ -505,7 +713,9 @@ def render_parse_tab(
         if show_supplier_selector:
             with selector_cols[1]:
                 try:
-                    supplier_options = _supplier_options(client.list_suppliers())
+                    supplier_options = _supplier_options(
+                        _session_cached("_cache_suppliers", client.list_suppliers, "Loading supplier list…")
+                    )
                 except Exception as e:
                     supplier_options = {}
                     st.error(f"Could not load suppliers: {e}")
@@ -546,188 +756,160 @@ def render_parse_tab(
             show_shop_selector, show_supplier_selector,
         )
     else:
-        paste_text = st.text_area(
-            "Paste WhatsApp message here",
-            key=f"{key_prefix}_paste_input",
-            placeholder="Paste WhatsApp message here",
-            label_visibility="collapsed",
-            height=150,
-        )
+        read_busy_key = f"{key_prefix}_read"
+        read_busy = loading_ui.is_busy(read_busy_key)
 
-        if st.button("Read items", key=f"{key_prefix}_read_btn") and paste_text:
-            run_id = timing.new_run_id()
-            with timing.section(
-                "FRONTEND: READ ITEMS", run_id=run_id, mode=mode, paste_chars=len(paste_text),
-                paste_lines=len(paste_text.splitlines()),
-            ):
-                try:
-                    # A large paste (e.g. a full delivery's worth of GRN lines) can
-                    # take a couple of minutes — each line goes through several
-                    # agent tool calls. 90s was too short and produced a client-side
-                    # timeout even though the backend was still working correctly
-                    # (confirmed: 42 items completed in ~133s, all matched).
-                    with st.spinner("Parsing — large pastes can take a minute or two…"):
-                        with timing.timed("http_post_parse"):
-                            resp = requests.post(
-                                f"{BACKEND_URL}/parse",
-                                json={"text": paste_text, "mode": mode},
-                                timeout=600,
-                            )
-                    if resp.ok:
-                        new_items = _with_row_ids(resp.json()["items"])
-                        existing_items = st.session_state.get(items_key) or []
-                        st.session_state[items_key] = existing_items + new_items
-                        st.session_state[f"{key_prefix}_confirm_results"] = None
-                        st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
-                        timing.log("parse_result", items_added=len(new_items))
-                    else:
-                        error = resp.json().get("error", resp.text)
-                        st.session_state[status_key] = f"Couldn't process that: {error}"
-                        timing.log("parse_failed", error=error)
-                except Exception as e:
-                    st.session_state[status_key] = f"Could not reach backend at {BACKEND_URL}: {e}"
-                    timing.log("parse_exception", error=str(e))
-
+        if read_busy:
+            # Replaces the paste box + button entirely while parsing.
+            text = loading_ui.busy_payload(read_busy_key, "paste_text")
+            new_items, error = _run_parse_flow(mode, text)
+            if error is not None:
+                st.session_state[status_key] = f"Couldn't process that: {error}"
+            else:
+                new_items = _with_row_ids(new_items)
+                existing_items = st.session_state.get(items_key) or []
+                st.session_state[items_key] = existing_items + new_items
+                st.session_state[f"{key_prefix}_confirm_results"] = None
+                st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
+            loading_ui.clear_busy(read_busy_key, "paste_text")
             st.rerun()
+        else:
+            paste_text = st.text_area(
+                "Paste WhatsApp message here",
+                key=f"{key_prefix}_paste_input",
+                placeholder="Paste WhatsApp message here",
+                label_visibility="collapsed",
+                height=150,
+            )
+
+            if st.button("Read items", key=f"{key_prefix}_read_btn") and paste_text:
+                loading_ui.start_busy(read_busy_key, paste_text=paste_text)
+                st.rerun()
 
         items = st.session_state.get(items_key)
 
         if items:
-            st.markdown("---")
-            st.markdown("**Review parsed items and fix anything before submitting:**")
+            confirm_busy_key = f"{key_prefix}_confirm"
+            confirm_busy = loading_ui.is_busy(confirm_busy_key)
+            confirm_label = {
+                "goods_received": "GRN", "product_updates": "stock update", "new_products": "new product",
+            }.get(mode, "item")
 
-            trust_mode = False
-            if mode == "goods_received":
-                trust_mode = st.checkbox(
-                    "Trust mode — only show flagged or non-exact matches",
-                    value=True, key=f"{key_prefix}_trust_mode",
+            if confirm_busy:
+                # Replaces the editable review table entirely while
+                # submitting — nothing clickable on screen, and no risk of
+                # re-deriving a different edited_items from the same
+                # widget keys mid-submit.
+                _submit_items(
+                    key_prefix, items_key, status_key, loading_ui.busy_payload(confirm_busy_key, "items"),
+                    selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+                    label=confirm_label,
                 )
-
-            edited_items = []
-            deleted_rid = None
-
-            if mode == "new_products":
-                widths = [1, 4.5, 1.1, 1.1, 0.5]
-                headers = ["Code", "Product name", "Price", "Initial stock", ""]
-
-                for col, header in zip(st.columns(widths), headers):
-                    col.markdown(f"**{header}**")
-
-                for item in items:
-                    rid = item["_rid"]
-                    cols = st.columns(widths)
-                    code = cols[0].text_input(
-                        "Code", value=item.get("code") or "",
-                        key=f"{key_prefix}_code_{rid}", label_visibility="collapsed",
-                    )
-                    name = cols[1].text_input(
-                        "Product name", value=item.get("name", ""),
-                        key=f"{key_prefix}_name_{rid}", label_visibility="collapsed",
-                    )
-                    price = cols[2].number_input(
-                        "Price", value=float((item.get("fields") or {}).get("price") or 0.0),
-                        min_value=0.0, step=0.01, format="%.2f",
-                        key=f"{key_prefix}_price_{rid}", label_visibility="collapsed",
-                    )
-                    quantity = cols[3].number_input(
-                        "Initial stock", value=int(item.get("quantity") or 0),
-                        step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
-                    )
-                    if cols[4].button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
-                        deleted_rid = rid
-                    edited_items.append({
-                        "_rid": rid,
-                        "raw_text": item.get("raw_text", ""),
-                        "action": "new_product",
-                        "name": name,
-                        "code": code or None,
-                        "fields": {"price": price},
-                        "quantity": quantity,
-                        "matched_product_id": None,
-                        "candidates": [],
-                    })
-
-            else:  # product_updates (stock_update) or goods_received: matched against the catalog
-                product_lookup = _product_lookup(catalog_products or [])
-
-                action = "goods_received" if mode == "goods_received" else "stock_update"
-                qty_label = "Qty" if mode == "goods_received" else "Qty / Δ"
-                edited_items, deleted_rid = _render_match_rows(
-                    items, key_prefix, action, qty_label, product_lookup,
-                    compact=(mode == "goods_received"),
-                    hide_statuses={"exact"} if trust_mode else frozenset(),
-                    hidden_caption=(
-                        "Trust mode: {n} exact match(es) hidden — turn it off to review everything."
-                        if trust_mode else None
-                    ),
-                )
-
-            if deleted_rid is not None:
-                st.session_state[items_key] = [it for it in edited_items if it["_rid"] != deleted_rid]
+                loading_ui.clear_busy(confirm_busy_key, "items")
                 st.rerun()
+            else:
+                st.markdown("---")
+                st.markdown("**Review parsed items and fix anything before submitting:**")
 
-            # Persist edits so a follow-up paste operates on the latest state.
-            st.session_state[items_key] = edited_items
+                trust_mode = False
+                if mode == "goods_received":
+                    trust_mode = st.checkbox(
+                        "Trust mode — only show flagged or non-exact matches",
+                        value=True, key=f"{key_prefix}_trust_mode",
+                    )
 
-            unmatched_count = sum(
-                1 for e in edited_items
-                if e["action"] in ("stock_update", "goods_received") and not e.get("matched_product_id")
-            )
-            if unmatched_count:
-                st.warning(
-                    f"Fix {unmatched_count} unmatched item(s) before submitting — "
-                    "select a product or delete the row."
-                )
+                edited_items = []
+                deleted_rid = None
 
-            if st.button(
-                "Confirm and Submit", key=f"{key_prefix}_confirm_btn", disabled=bool(unmatched_count)
-            ):
-                missing_shop = show_shop_selector and not selected_shop_id and any(
-                    e["action"] in ("stock_update", "goods_received") for e in edited_items
+                if mode == "new_products":
+                    widths = [1, 4.5, 1.1, 1.1, 0.5]
+                    headers = ["Code", "Product name", "Price", "Initial stock", ""]
+
+                    for col, header in zip(st.columns(widths), headers):
+                        col.markdown(f"**{header}**")
+
+                    for item in items:
+                        rid = item["_rid"]
+                        cols = st.columns(widths)
+                        code = cols[0].text_input(
+                            "Code", value=item.get("code") or "",
+                            key=f"{key_prefix}_code_{rid}", label_visibility="collapsed",
+                        )
+                        name = cols[1].text_input(
+                            "Product name", value=item.get("name", ""),
+                            key=f"{key_prefix}_name_{rid}", label_visibility="collapsed",
+                        )
+                        price = cols[2].number_input(
+                            "Price", value=float((item.get("fields") or {}).get("price") or 0.0),
+                            min_value=0.0, step=0.01, format="%.2f",
+                            key=f"{key_prefix}_price_{rid}", label_visibility="collapsed",
+                        )
+                        quantity = cols[3].number_input(
+                            "Initial stock", value=int(item.get("quantity") or 0),
+                            step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
+                        )
+                        if cols[4].button("\U0001F5D1", key=f"{key_prefix}_del_{rid}"):
+                            deleted_rid = rid
+                        edited_items.append({
+                            "_rid": rid,
+                            "raw_text": item.get("raw_text", ""),
+                            "action": "new_product",
+                            "name": name,
+                            "code": code or None,
+                            "fields": {"price": price},
+                            "quantity": quantity,
+                            "matched_product_id": None,
+                            "candidates": [],
+                        })
+
+                else:  # product_updates (stock_update) or goods_received: matched against the catalog
+                    product_lookup = _product_lookup(catalog_products or [])
+
+                    action = "goods_received" if mode == "goods_received" else "stock_update"
+                    qty_label = "Qty" if mode == "goods_received" else "Qty / Δ"
+                    edited_items, deleted_rid = _render_match_rows(
+                        items, key_prefix, action, qty_label, product_lookup,
+                        compact=(mode == "goods_received"),
+                        hide_statuses={"exact"} if trust_mode else frozenset(),
+                        hidden_caption=(
+                            "Trust mode: {n} exact match(es) hidden — turn it off to review everything."
+                            if trust_mode else None
+                        ),
+                    )
+
+                if deleted_rid is not None:
+                    st.session_state[items_key] = [it for it in edited_items if it["_rid"] != deleted_rid]
+                    st.rerun()
+
+                # Persist edits so a follow-up paste operates on the latest state.
+                st.session_state[items_key] = edited_items
+
+                unmatched_count = sum(
+                    1 for e in edited_items
+                    if e["action"] in ("stock_update", "goods_received") and not e.get("matched_product_id")
                 )
-                missing_supplier = show_supplier_selector and not selected_supplier_id and any(
-                    e["action"] == "goods_received" for e in edited_items
-                )
-                if missing_shop:
-                    st.warning("Select a shop first.")
-                elif missing_supplier:
-                    st.warning("Select a supplier first.")
-                else:
-                    payload_items = [{k: v for k, v in it.items() if k != "_rid"} for it in edited_items]
-                    run_id = timing.new_run_id()
-                    with timing.section(
-                        "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
-                    ):
-                        try:
-                            with st.spinner("Submitting…"):
-                                with timing.timed("http_post_confirm"):
-                                    resp = requests.post(
-                                        f"{BACKEND_URL}/confirm",
-                                        json={
-                                            "shop_id": selected_shop_id,
-                                            "supplier_id": selected_supplier_id,
-                                            "items": payload_items,
-                                        },
-                                        # stock_update does two HTTP calls per item
-                                        # (get_inventory + set_inventory), so a large
-                                        # batch can add up — same false-timeout risk
-                                        # as /parse.
-                                        timeout=300,
-                                    )
-                            if resp.ok:
-                                st.session_state[f"{key_prefix}_confirm_results"] = resp.json()["results"]
-                                # Clear so the next paste starts from empty rather than
-                                # appending onto items that were already submitted.
-                                st.session_state[items_key] = []
-                                timing.log("confirm_result", results=len(st.session_state[f"{key_prefix}_confirm_results"]))
-                                st.rerun()
-                            else:
-                                error = resp.json().get("error", resp.text)
-                                st.error(f"Confirm failed: {error}")
-                                timing.log("confirm_failed", error=error)
-                        except Exception as e:
-                            st.error(f"Could not reach confirm backend at {BACKEND_URL}: {e}")
-                            timing.log("confirm_exception", error=str(e))
+                if unmatched_count:
+                    st.warning(
+                        f"Fix {unmatched_count} unmatched item(s) before submitting — "
+                        "select a product or delete the row."
+                    )
+
+                if st.button(
+                    "Confirm and Submit", key=f"{key_prefix}_confirm_btn", disabled=bool(unmatched_count)
+                ):
+                    missing_shop = show_shop_selector and not selected_shop_id and any(
+                        e["action"] in ("stock_update", "goods_received") for e in edited_items
+                    )
+                    missing_supplier = show_supplier_selector and not selected_supplier_id and any(
+                        e["action"] == "goods_received" for e in edited_items
+                    )
+                    if missing_shop:
+                        st.warning("Select a shop first.")
+                    elif missing_supplier:
+                        st.warning("Select a supplier first.")
+                    else:
+                        loading_ui.start_busy(confirm_busy_key, items=edited_items)
+                        st.rerun()
 
     results = st.session_state.get(f"{key_prefix}_confirm_results")
     if results:
@@ -776,6 +958,7 @@ def _render_production_banner():
 
 
 st.set_page_config(page_title="Sales Intellect POS", layout="wide")
+loading_ui.inject_global_css()
 
 if IS_PRODUCTION:
     _render_production_banner()
@@ -788,14 +971,19 @@ except ValueError as e:
     st.error(str(e))
     st.stop()
 
-# Shared product catalog, fetched once per rerun from the backend's cache
-# (never the live Sales Intellect API directly — see _fetch_catalog()) and
-# passed down to every tab below, so multiple enabled tabs in one rerun
-# don't each fetch it separately.
+# Shared product catalog, fetched once per browser session (not on every
+# rerun — see _session_cached()) and passed down to every tab below, so
+# multiple enabled tabs in one rerun don't each fetch it separately.
+# Served from the backend's own cache (never the live Sales Intellect API
+# directly — see _fetch_catalog()); only "Refresh Catalog" below does a
+# live fetch, which also updates this session's cached copy directly.
 catalog_products = []
-catalog_col, refresh_col = st.columns([5, 1])
+catalog_col, refresh_catalog_col, refresh_suppliers_col = st.columns([4, 1, 1.2])
 try:
-    catalog_data = _fetch_catalog()
+    if "_cache_catalog" not in st.session_state:
+        with loading_ui.overlay("Loading product catalog…"):
+            st.session_state["_cache_catalog"] = _fetch_catalog()
+    catalog_data = st.session_state["_cache_catalog"]
     catalog_products = catalog_data.get("products", [])
     fetched_at = catalog_data.get("fetched_at")
     cache_found = catalog_data.get("cache_found", True)
@@ -811,23 +999,52 @@ except Exception as e:
     with catalog_col:
         st.caption(f"Could not load product catalog: {e}")
 
-with refresh_col:
-    if st.button("Refresh Catalog", key="global_catalog_refresh"):
-        run_id = timing.new_run_id()
-        with timing.section("FRONTEND: REFRESH CATALOG", run_id=run_id):
-            try:
+with refresh_catalog_col:
+    refresh_catalog_clicked = st.button(
+        "Refresh Catalog", key="global_catalog_refresh",
+        disabled=loading_ui.is_busy("catalog_refresh"),
+    )
+if refresh_catalog_clicked and not loading_ui.is_busy("catalog_refresh"):
+    loading_ui.start_busy("catalog_refresh")
+    st.rerun()
+
+if loading_ui.is_busy("catalog_refresh"):
+    run_id = timing.new_run_id()
+    with timing.section("FRONTEND: REFRESH CATALOG", run_id=run_id):
+        try:
+            with loading_ui.overlay("Refreshing catalog from Sales Intellect…"):
                 with timing.timed("http_post_catalog_refresh"):
                     resp = requests.post(f"{BACKEND_URL}/catalog/refresh", timeout=120)
-                if resp.ok:
-                    timing.log("catalog_refresh_result", count=resp.json().get("count"))
-                else:
-                    error = resp.json().get("error", resp.text)
-                    st.error(f"Refresh failed: {error}")
-                    timing.log("catalog_refresh_failed", error=error)
-            except Exception as e:
-                st.error(f"Could not reach backend at {BACKEND_URL}: {e}")
-                timing.log("catalog_refresh_exception", error=str(e))
-        st.rerun()
+            if resp.ok:
+                count = resp.json().get("count")
+                timing.log("catalog_refresh_result", count=count)
+                try:
+                    # Update this session's own cached view immediately —
+                    # now that the catalog is session-cached (not refetched
+                    # every rerun), nothing else would ever pick up the
+                    # refreshed data otherwise.
+                    st.session_state["_cache_catalog"] = _fetch_catalog()
+                except Exception:
+                    pass  # The refresh itself still succeeded; this session's view just stays stale until reloaded.
+                st.toast(f"Catalog refreshed — {count} product(s)")
+            else:
+                error = resp.json().get("error", resp.text)
+                st.error(f"Refresh failed: {error}")
+                timing.log("catalog_refresh_failed", error=error)
+        except Exception as e:
+            st.error(f"Could not reach backend at {BACKEND_URL}: {e}")
+            timing.log("catalog_refresh_exception", error=str(e))
+    loading_ui.clear_busy("catalog_refresh")
+    st.rerun()
+
+with refresh_suppliers_col:
+    if st.button(
+        "Refresh Suppliers", key="global_suppliers_refresh",
+        help="Also refreshes the shop list. Shops and suppliers rarely change, "
+             "so they're only refetched when you click this.",
+    ):
+        st.session_state.pop("_cache_shops", None)
+        st.session_state.pop("_cache_suppliers", None)
 
 enabled_tabs = [t for t in TAB_CONFIG if t["enabled"]]
 

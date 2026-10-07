@@ -10,3 +10,4 @@ __pycache__/
 # Local runtime artifacts — not shared state, regenerated per-machine.
 timings.log
 catalog_cache.json
+parse_jobs/
