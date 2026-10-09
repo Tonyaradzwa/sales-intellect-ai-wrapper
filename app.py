@@ -745,9 +745,6 @@ def render_parse_tab(
                 )
                 selected_supplier_id = supplier_options.get(supplier_label)
 
-        if mode == "goods_received":
-            st.caption("Payment: Cash")
-
     items_key = f"{key_prefix}_parsed_items"
     status_key = f"{key_prefix}_status_message"
     if status_key not in st.session_state:
