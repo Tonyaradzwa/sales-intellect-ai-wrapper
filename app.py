@@ -10,6 +10,7 @@ Run with:
 import os
 import time
 import uuid
+from datetime import datetime
 
 import requests
 import streamlit as st
@@ -158,6 +159,19 @@ def _fetch_catalog():
         resp = requests.get(f"{BACKEND_URL}/catalog", timeout=120)
     resp.raise_for_status()
     return resp.json()
+
+
+def _format_fetched_at(fetched_at):
+    """"2026-10-05T11:58:21" -> "5 October 2026 at 11:58". Falls back to
+    the raw value if it's not in the expected ISO shape (server.py's
+    datetime.now().isoformat(timespec="seconds"))."""
+    if not fetched_at:
+        return fetched_at
+    try:
+        dt = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return fetched_at
+    return f"{dt.day} {dt.strftime('%B %Y at %H:%M')}"
 
 
 def _with_row_ids(items):
@@ -989,7 +1003,7 @@ try:
         else:
             st.caption(
                 f"Product catalog: {len(catalog_products)} products"
-                + (f" · last refreshed {fetched_at}" if fetched_at else "")
+                + (f" · last refreshed {_format_fetched_at(fetched_at)}" if fetched_at else "")
             )
 except Exception as e:
     with catalog_col:
