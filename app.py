@@ -25,6 +25,23 @@ BACKEND_URL = os.environ.get("SI_BACKEND_URL", "http://127.0.0.1:5050")
 def _env_flag(name, default="false"):
     return os.environ.get(name, default).strip().lower() == "true"
 
+
+# GRN always uses the "N/A" supplier and Cash payment in practice — these
+# default to on so the dropdown/caption for a choice nobody actually makes
+# isn't on screen. Set to "false" (per deployment, via env var) the day a
+# real alternative is needed and the picker should come back.
+DEFAULT_SUPPLIER_TO_NA = _env_flag("SI_GRN_DEFAULT_SUPPLIER_TO_NA", default="true")
+# Payment method has no selector at all right now (server.py hardcodes
+# _GRN_CASH_PAYMENT_METHOD_ID unconditionally) — this flag doesn't gate
+# anything yet, it just names the toggle point for when a payment method
+# picker is actually built.
+DEFAULT_PAYMENT_TO_CASH = _env_flag("SI_GRN_DEFAULT_PAYMENT_TO_CASH", default="true")
+# Off by default — with DEFAULT_SUPPLIER_TO_NA also on by default, the
+# Supplier dropdown is hidden and never changes, so a button to refresh
+# supplier data has nothing to serve. Set to "true" if DEFAULT_SUPPLIER_TO_NA
+# is ever turned off and the dropdown (and a reason to refresh it) is back.
+SHOW_REFRESH_SUPPLIERS = _env_flag("SI_SHOW_REFRESH_SUPPLIERS", default="false")
+
 # Prod and preprod are two separate deployments of this same codebase, each
 # with its own .env (and crucially its own SI_API_TOKEN — see .env.example).
 # APP_ENV just controls the visual "you are in production" tell below; it
@@ -701,10 +718,31 @@ def render_parse_tab(
     selected_shop_id = None
     selected_supplier_id = None
     if show_shop_selector or show_supplier_selector:
-        selector_cols = st.columns(2)
+        supplier_options = {}
+        supplier_fetch_error = None
+        if show_supplier_selector:
+            try:
+                supplier_options = _supplier_options(
+                    _session_cached("_cache_suppliers", client.list_suppliers, "Loading supplier list…")
+                )
+            except Exception as e:
+                supplier_fetch_error = str(e)
+
+        # Resolved here (not inside the column below) so the layout can
+        # give Shop the full width when Supplier ends up contributing
+        # nothing to it — otherwise Shop is stuck in a half-width column
+        # next to permanently empty space.
+        show_supplier_dropdown = show_supplier_selector and not (
+            DEFAULT_SUPPLIER_TO_NA and "N/A" in supplier_options
+        )
+
+        if show_shop_selector and show_supplier_dropdown:
+            shop_col, supplier_col = st.columns(2)
+        else:
+            shop_col = supplier_col = st.container()
 
         if show_shop_selector:
-            with selector_cols[0]:
+            with shop_col:
                 try:
                     shop_options = _shop_options(
                         _session_cached("_cache_shops", client.list_shops, "Loading shop list…")
@@ -721,29 +759,31 @@ def render_parse_tab(
                 selected_shop_id = shop_options.get(shop_label)
 
         if show_supplier_selector:
-            with selector_cols[1]:
-                try:
-                    supplier_options = _supplier_options(
-                        _session_cached("_cache_suppliers", client.list_suppliers, "Loading supplier list…")
-                    )
-                except Exception as e:
-                    supplier_options = {}
-                    st.error(f"Could not load suppliers: {e}")
+            with supplier_col:
+                if supplier_fetch_error:
+                    st.error(f"Could not load suppliers: {supplier_fetch_error}")
 
-                supplier_keys = list(supplier_options.keys()) or ["-"]
-                # "N/A" (no tracked supplier) covers the overwhelming
-                # majority of deliveries, so default to it instead of
-                # whatever happens to sort first.
-                default_supplier_index = (
-                    supplier_keys.index("N/A") if "N/A" in supplier_keys else 0
-                )
-                supplier_label = st.selectbox(
-                    "Supplier",
-                    options=supplier_keys,
-                    index=default_supplier_index,
-                    key=f"{key_prefix}_supplier",
-                )
-                selected_supplier_id = supplier_options.get(supplier_label)
+                if not show_supplier_dropdown:
+                    # Always N/A in practice — no point showing a dropdown
+                    # for a choice that's never actually made. Set
+                    # SI_GRN_DEFAULT_SUPPLIER_TO_NA=false to bring the
+                    # dropdown back.
+                    selected_supplier_id = supplier_options.get("N/A")
+                else:
+                    supplier_keys = list(supplier_options.keys()) or ["-"]
+                    # "N/A" (no tracked supplier) covers the overwhelming
+                    # majority of deliveries, so default to it instead of
+                    # whatever happens to sort first.
+                    default_supplier_index = (
+                        supplier_keys.index("N/A") if "N/A" in supplier_keys else 0
+                    )
+                    supplier_label = st.selectbox(
+                        "Supplier",
+                        options=supplier_keys,
+                        index=default_supplier_index,
+                        key=f"{key_prefix}_supplier",
+                    )
+                    selected_supplier_id = supplier_options.get(supplier_label)
 
     items_key = f"{key_prefix}_parsed_items"
     status_key = f"{key_prefix}_status_message"
@@ -985,7 +1025,10 @@ except ValueError as e:
 # directly — see _fetch_catalog()); only "Refresh Catalog" below does a
 # live fetch, which also updates this session's cached copy directly.
 catalog_products = []
-catalog_col, refresh_catalog_col, refresh_suppliers_col = st.columns([4, 1, 1.2])
+if SHOW_REFRESH_SUPPLIERS:
+    catalog_col, refresh_catalog_col, refresh_suppliers_col = st.columns([4, 1, 1.2])
+else:
+    catalog_col, refresh_catalog_col = st.columns([4, 1])
 try:
     if "_cache_catalog" not in st.session_state:
         with loading_ui.overlay("Loading product catalog…"):
@@ -1044,14 +1087,15 @@ if loading_ui.is_busy("catalog_refresh"):
     loading_ui.clear_busy("catalog_refresh")
     st.rerun()
 
-with refresh_suppliers_col:
-    if st.button(
-        "Refresh Suppliers", key="global_suppliers_refresh",
-        help="Also refreshes the shop list. Shops and suppliers rarely change, "
-             "so they're only refetched when you click this.",
-    ):
-        st.session_state.pop("_cache_shops", None)
-        st.session_state.pop("_cache_suppliers", None)
+if SHOW_REFRESH_SUPPLIERS:
+    with refresh_suppliers_col:
+        if st.button(
+            "Refresh Suppliers", key="global_suppliers_refresh",
+            help="Also refreshes the shop list. Shops and suppliers rarely change, "
+                 "so they're only refetched when you click this.",
+        ):
+            st.session_state.pop("_cache_shops", None)
+            st.session_state.pop("_cache_suppliers", None)
 
 enabled_tabs = [t for t in TAB_CONFIG if t["enabled"]]
 
