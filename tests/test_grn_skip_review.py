@@ -126,7 +126,11 @@ def test_clean_parse_submits_immediately_with_no_read_or_confirm_buttons(grn_ski
 
     assert len(grn_skip_review["confirmed"]) == 1
     assert len(grn_skip_review["confirmed"][0]["items"]) == 2
-    assert at.session_state["grn_status_message"] == "Submitted GRN with 2 item(s)."
+    # No persistent status message on success — just the toast, plus the
+    # "Submission results" section driven by grn_confirm_results — a
+    # separate box repeating the same thing would be redundant.
+    assert at.session_state["grn_status_message"] is None
+    assert [t.value for t in at.toast] == ["Submitted GRN with 2 item(s)."]
     assert at.session_state["grn_parsed_items"] == []
 
 
@@ -165,5 +169,8 @@ def test_flagged_item_blocks_submit_until_fixed_then_submits_full_batch(grn_skip
     assert len(grn_skip_review["confirmed"]) == 1
     # All 3 items go through, including the 2 that were never shown to staff.
     assert len(grn_skip_review["confirmed"][0]["items"]) == 3
-    assert at.session_state["grn_status_message"] == "Submitted GRN with 3 item(s)."
+    # The earlier "flagged" status message is cleared on success, not left
+    # to linger — confirmation now comes from the toast instead.
+    assert at.session_state["grn_status_message"] is None
+    assert [t.value for t in at.toast] == ["Submitted GRN with 3 item(s)."]
     assert at.session_state["grn_parsed_items"] == []

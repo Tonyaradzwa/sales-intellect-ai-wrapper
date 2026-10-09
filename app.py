@@ -488,9 +488,13 @@ def _submit_items(
 
         st.session_state[f"{key_prefix}_confirm_results"] = results
         st.session_state[items_key] = []
-        message = f"Submitted {label} with {len(payload_items)} item(s)."
-        st.session_state[status_key] = message
-        st.toast(message)
+        # No status_key message here — the toast plus the "Submission
+        # results" section below already cover success; a persistent box
+        # repeating the same thing was redundant. Explicitly cleared (not
+        # just left alone) so a stale prior message — e.g. "N item(s) are
+        # flagged" from before this submission — doesn't linger on screen.
+        st.session_state[status_key] = None
+        st.toast(f"Submitted {label} with {len(payload_items)} item(s).")
 
 
 def _run_parse_flow(mode, text):
