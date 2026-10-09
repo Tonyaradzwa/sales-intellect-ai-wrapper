@@ -132,6 +132,25 @@ def test_clean_parse_submits_immediately_with_no_read_or_confirm_buttons(grn_ski
     assert at.session_state["grn_status_message"] is None
     assert [t.value for t in at.toast] == ["Submitted GRN with 2 item(s)."]
     assert at.session_state["grn_parsed_items"] == []
+    # Paste box clears itself on a fully-successful submit.
+    assert at.text_area(key="grn_paste_input").value == ""
+
+
+def test_clear_button_empties_the_paste_box(grn_skip_review):
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    _start(at)
+
+    at.text_area(key="grn_paste_input").set_value("some pasted text").run()
+    assert at.text_area(key="grn_paste_input").value == "some pasted text"
+
+    at.button(key="grn_clear_paste_btn").click().run()
+    assert not at.exception, at.exception
+    assert at.text_area(key="grn_paste_input").value == ""
+    # Clearing is just the text box — doesn't touch anything else.
+    assert len(grn_skip_review["confirmed"]) == 0
 
 
 def test_flagged_item_blocks_submit_until_fixed_then_submits_full_batch(grn_skip_review):

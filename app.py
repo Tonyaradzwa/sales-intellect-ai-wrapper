@@ -488,6 +488,23 @@ def _submit_items(
 
         st.session_state[f"{key_prefix}_confirm_results"] = results
         st.session_state[items_key] = []
+        if results and all(r["success"] for r in results):
+            # Everything went through clean — clear the paste box so the
+            # next delivery starts from empty instead of staff having to
+            # select-all/delete the old text themselves. Left alone on a
+            # partial failure, since the pasted text is still useful for
+            # reference/retry then.
+            #
+            # Deferred via a flag rather than writing straight to
+            # st.session_state[paste_input_key] here: the classic flow
+            # (unlike SKIP REVIEW) renders the paste text_area and the
+            # review table/submit button in the same script run, so by
+            # the time _submit_items runs, that widget may already be
+            # instantiated this run — Streamlit forbids writing to a
+            # widget's session_state key after that point. render_parse_tab
+            # consumes this flag at the very top of its next run, before
+            # any text_area exists yet.
+            st.session_state[f"{key_prefix}_paste_input_pending_clear"] = True
         # No status_key message here — the toast plus the "Submission
         # results" section below already cover success; a persistent box
         # repeating the same thing was redundant. Explicitly cleared (not
@@ -495,6 +512,78 @@ def _submit_items(
         # flagged" from before this submission — doesn't linger on screen.
         st.session_state[status_key] = None
         st.toast(f"Submitted {label} with {len(payload_items)} item(s).")
+
+
+def _render_paste_box(key_prefix, button_label, button_key):
+    """Paste text area (with a small "Clear" button overlaid in its
+    top-right corner, emptying it without staff having to select-all/
+    delete by hand) + a primary action button below. Returns
+    (paste_text, button_clicked).
+
+    The Clear button uses on_click rather than checking its return value
+    and setting st.session_state directly below — Streamlit forbids
+    writing to a widget's session_state key after that widget has already
+    been instantiated in the same script run, and the text_area above is
+    instantiated first. on_click callbacks run before the script re-runs
+    from the top, so the write lands before the text_area exists in that
+    next run instead.
+    """
+    pastebox_key = f"{key_prefix}_pastebox"
+    clear_key = f"{key_prefix}_clear_paste_btn"
+
+    with st.container(key=pastebox_key):
+        paste_text = st.text_area(
+            "Paste WhatsApp message here",
+            key=f"{key_prefix}_paste_input",
+            placeholder="Paste WhatsApp message here",
+            label_visibility="collapsed",
+            height=150,
+        )
+
+        def _clear_paste():
+            st.session_state[f"{key_prefix}_paste_input"] = ""
+
+        st.button("Clear", key=clear_key, on_click=_clear_paste)
+
+    # Overlays the Clear button into the text area's own top-right corner
+    # instead of sitting as a separate full-size button below it — small
+    # and muted (gray) so it reads as a minor, secondary action next to
+    # the primary (green) submit button underneath. Top, not bottom:
+    # Streamlit's own "Press ⌘+Enter to apply" hint (shown while there's
+    # an uncommitted edit) renders bottom-right of the textarea, and the
+    # two were colliding there.
+    st.markdown(
+        f"""
+        <style>
+        .st-key-{pastebox_key} {{ position: relative; }}
+        .st-key-{pastebox_key} textarea {{ resize: none; }}
+        .st-key-{clear_key} {{
+            position: absolute;
+            top: 0.6rem;
+            right: 0.6rem;
+            z-index: 5;
+            width: auto;
+        }}
+        .st-key-{clear_key} button {{
+            padding: 0.1rem 0.6rem;
+            font-size: 0.75rem;
+            min-height: unset;
+            background-color: rgba(120, 120, 120, 0.15);
+            border-color: rgba(120, 120, 120, 0.4);
+            color: inherit;
+        }}
+        .st-key-{clear_key} button:hover {{
+            background-color: rgba(120, 120, 120, 0.3);
+            border-color: rgba(120, 120, 120, 0.6);
+            color: inherit;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    clicked = st.button(button_label, key=button_key)
+    return paste_text, clicked
 
 
 def _run_parse_flow(mode, text):
@@ -625,6 +714,33 @@ def _render_grn_skip_review(
     pending_items = st.session_state.get(items_key) or []
     submit_busy_key = f"{key_prefix}_submit"
     submit_busy = loading_ui.is_busy(submit_busy_key)
+    submit_btn_key = f"{key_prefix}_submit_btn"
+
+    # "Submit GRN" (both instances below share this key — the correction
+    # view's button and the fresh-paste one) stands out in green as the
+    # one action that actually submits, distinct from Clear's muted gray.
+    st.markdown(
+        f"""
+        <style>
+        .st-key-{submit_btn_key} button {{
+            background-color: #16a34a;
+            border-color: #16a34a;
+            color: #ffffff;
+        }}
+        .st-key-{submit_btn_key} button:hover {{
+            background-color: #15803d;
+            border-color: #15803d;
+            color: #ffffff;
+        }}
+        .st-key-{submit_btn_key} button:disabled {{
+            background-color: rgba(22, 163, 74, 0.35);
+            border-color: rgba(22, 163, 74, 0.35);
+            color: rgba(255, 255, 255, 0.8);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if pending_items:
         if submit_busy:
@@ -686,15 +802,10 @@ def _render_grn_skip_review(
         st.rerun()
         return
 
-    paste_text = st.text_area(
-        "Paste WhatsApp message here",
-        key=f"{key_prefix}_paste_input",
-        placeholder="Paste WhatsApp message here",
-        label_visibility="collapsed",
-        height=150,
+    paste_text, submit_clicked = _render_paste_box(
+        key_prefix, "Submit GRN", f"{key_prefix}_submit_btn",
     )
-
-    if st.button("Submit GRN", key=f"{key_prefix}_submit_btn") and paste_text:
+    if submit_clicked and paste_text:
         loading_ui.start_busy(submit_busy_key, paste_text=paste_text)
         st.rerun()
 
@@ -718,6 +829,13 @@ def render_parse_tab(
         st.subheader(subheader)
     if caption:
         st.caption(caption)
+
+    # Must run before the paste text_area is instantiated anywhere below
+    # (classic or SKIP REVIEW) — see the comment on this flag's write
+    # site in _submit_items for why it's deferred to here instead of
+    # cleared directly at submit time.
+    if st.session_state.pop(f"{key_prefix}_paste_input_pending_clear", False):
+        st.session_state[f"{key_prefix}_paste_input"] = ""
 
     selected_shop_id = None
     selected_supplier_id = None
@@ -825,15 +943,11 @@ def render_parse_tab(
             loading_ui.clear_busy(read_busy_key, "paste_text")
             st.rerun()
         else:
-            paste_text = st.text_area(
-                "Paste WhatsApp message here",
-                key=f"{key_prefix}_paste_input",
-                placeholder="Paste WhatsApp message here",
-                label_visibility="collapsed",
-                height=150,
+            paste_text, read_clicked = _render_paste_box(
+                key_prefix, "Read items", f"{key_prefix}_read_btn",
             )
 
-            if st.button("Read items", key=f"{key_prefix}_read_btn") and paste_text:
+            if read_clicked and paste_text:
                 loading_ui.start_busy(read_busy_key, paste_text=paste_text)
                 st.rerun()
 
