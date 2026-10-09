@@ -14,3 +14,10 @@ enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
+
+[client]
+# Hides the built-in "Deploy" button (and rerun/clear-cache, the rest of
+# the "developer options") — this app has its own deployment system
+# (deploy/), not Streamlit's. Keeps the rest of the hamburger menu (e.g.
+# the light/dark theme toggle) intact — "minimal" would hide that too.
+toolbarMode = "viewer"
