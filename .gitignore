@@ -11,3 +11,6 @@ __pycache__/
 timings.log
 catalog_cache.json
 parse_jobs/
+
+# Ad-hoc API investigation output — may contain real production catalog data.
+products.json

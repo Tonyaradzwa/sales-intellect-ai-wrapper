@@ -42,15 +42,10 @@ TAB_CONFIG = [
         "render_kwargs": dict(
             key_prefix="grn",
             mode="goods_received",
-            # Implementation notes (kept out of the staff-facing caption):
-            # all items in one submission are recorded as a single GRN, and
-            # payment method is fixed to Cash — the only one currently
-            # supported, see _GRN_CASH_PAYMENT_METHOD_ID in server.py.
-            caption=(
-                "Paste the delivery message from WhatsApp. You'll check and "
-                "edit every item before anything is saved. New products go "
-                "in Bulk Product Upload."
-            ),
+            # Implementation notes: all items in one submission are recorded
+            # as a single GRN, and payment method is fixed to Cash — the
+            # only one currently supported, see _GRN_CASH_PAYMENT_METHOD_ID
+            # in server.py.
             show_shop_selector=True,
             show_supplier_selector=True,
         ),
@@ -670,8 +665,8 @@ def _render_grn_skip_review(
 
 
 def render_parse_tab(
-    key_prefix, mode, caption, show_shop_selector, show_supplier_selector=False,
-    subheader=None, catalog_products=None,
+    key_prefix, mode, show_shop_selector, show_supplier_selector=False,
+    subheader=None, caption=None, catalog_products=None,
 ):
     """Shared paste -> review -> confirm flow.
 
@@ -686,7 +681,8 @@ def render_parse_tab(
     """
     if subheader:
         st.subheader(subheader)
-    st.caption(caption)
+    if caption:
+        st.caption(caption)
 
     selected_shop_id = None
     selected_supplier_id = None
