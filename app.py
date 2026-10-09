@@ -970,7 +970,7 @@ loading_ui.inject_global_css()
 if IS_PRODUCTION:
     _render_production_banner()
 
-st.title("Sales Intellect POS", anchor=False)
+st.title("Sales Intellect AI Wrapper", anchor=False)
 
 try:
     client = get_client()
