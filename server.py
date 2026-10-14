@@ -1011,6 +1011,10 @@ def parse():
         return jsonify({"error": "No text provided."}), 400
 
     run_id = timing.new_run_id()
+    # Logged before any parsing/matching happens, so the staff member's raw
+    # paste survives even if the request later fails or the frontend session
+    # is lost — otherwise the original text is never persisted anywhere.
+    actions.log("parse_request_received", run_id=run_id, mode=mode, text=text.replace("\n", "\\n"))
     with timing.section("PARSE REQUEST", run_id=run_id, mode=mode, text_chars=len(text)):
         # Served from the file-backed cache — search_products and
         # generate_next_product_code both search this same in-memory snapshot.
