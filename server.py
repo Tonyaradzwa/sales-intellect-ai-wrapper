@@ -32,6 +32,7 @@ from datetime import date, datetime
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, create_sdk_mcp_server, query, tool
 from flask import Flask, jsonify, request
 
+import actions
 import job_store
 import timing
 from client import SalesIntellectClient
@@ -457,8 +458,15 @@ def _find_exact_matches(index, lines):
                 "code": p.get("code"),
                 "exact_match": True,
             })
+            actions.log("tier_catalog_hit", raw_text=raw_text, product=p["name"], product_id=p["product_id"])
         else:
             remaining_lines.append(raw_text)
+            actions.log(
+                "tier_catalog_miss",
+                raw_text=raw_text,
+                reason="ambiguous" if matches else "no_match",
+                candidates=len(matches) or None,
+            )
     return exact_items, remaining_lines
 
 
@@ -571,6 +579,7 @@ def _find_cached_matches(lines, action):
         cached_matches = _lookup_cache.get(key)
         if not cached_matches:
             remaining_lines.append(raw_text)
+            actions.log("tier_cache_miss", raw_text=raw_text)
             continue
         for match in cached_matches:
             cache_items.append({
@@ -585,6 +594,10 @@ def _find_cached_matches(lines, action):
                 "cache_hit": True,
                 "action": action,
             })
+            actions.log(
+                "tier_cache_hit",
+                raw_text=raw_text, product=match["name"], product_id=match["matched_product_id"],
+            )
     return cache_items, remaining_lines
 
 
@@ -604,6 +617,7 @@ def _cache_match(name_query, matches):
         for m in matched
     ]
     _lookup_cache.merge(key, entries)
+    actions.log("cache_write", key=key, entries=len(entries))
 
 
 def _find_confident_fuzzy_matches(index, lines, action):
@@ -623,6 +637,7 @@ def _find_confident_fuzzy_matches(index, lines, action):
         query_words = _search_words(split["name_query"])
         if not query_words:
             remaining_lines.append(raw_text)
+            actions.log("tier_fuzzy_miss", raw_text=raw_text, reason="no_query_words")
             continue
 
         candidate_ids = set()
@@ -636,6 +651,12 @@ def _find_confident_fuzzy_matches(index, lines, action):
 
         if len(full_coverage) != 1:
             remaining_lines.append(raw_text)
+            actions.log(
+                "tier_fuzzy_miss",
+                raw_text=raw_text,
+                reason="ambiguous" if full_coverage else "no_match",
+                candidates=len(full_coverage) or None,
+            )
             continue
 
         p = index.by_id[full_coverage[0]]
@@ -651,6 +672,7 @@ def _find_confident_fuzzy_matches(index, lines, action):
             "fuzzy_auto_match": True,
             "action": action,
         })
+        actions.log("tier_fuzzy_hit", raw_text=raw_text, product=p["name"], product_id=p["product_id"])
         _cache_match(split["name_query"], [fuzzy_items[-1]])
     return fuzzy_items, remaining_lines
 
@@ -848,6 +870,18 @@ def _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items, pro
                         _split_trailing_quantity(args["raw_text"])["name_query"],
                         [collected_items[-1]],
                     )
+                    if matched:
+                        actions.log(
+                            "tier_agent_hit",
+                            raw_text=args["raw_text"], action="goods_received",
+                            product=matched["name"], product_id=matched_id,
+                        )
+                    else:
+                        actions.log(
+                            "tier_agent_miss",
+                            raw_text=args["raw_text"], action="goods_received",
+                            candidates=len(candidates) or None,
+                        )
                 return {"content": [{"type": "text", "text": "Recorded."}]}
 
             tools.append(submit_result)
@@ -899,6 +933,18 @@ def _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items, pro
                         _split_trailing_quantity(args["raw_text"])["name_query"],
                         [collected_items[-1]],
                     )
+                    if matched:
+                        actions.log(
+                            "tier_agent_hit",
+                            raw_text=args["raw_text"], action="stock_update",
+                            product=matched["name"], product_id=matched_id,
+                        )
+                    else:
+                        actions.log(
+                            "tier_agent_miss",
+                            raw_text=args["raw_text"], action="stock_update",
+                            candidates=len(candidates) or None,
+                        )
                 return {"content": [{"type": "text", "text": "Recorded."}]}
 
             tools.append(submit_result)
