@@ -488,23 +488,9 @@ def _submit_items(
 
         st.session_state[f"{key_prefix}_confirm_results"] = results
         st.session_state[items_key] = []
-        if results and all(r["success"] for r in results):
-            # Everything went through clean — clear the paste box so the
-            # next delivery starts from empty instead of staff having to
-            # select-all/delete the old text themselves. Left alone on a
-            # partial failure, since the pasted text is still useful for
-            # reference/retry then.
-            #
-            # Deferred via a flag rather than writing straight to
-            # st.session_state[paste_input_key] here: the classic flow
-            # (unlike SKIP REVIEW) renders the paste text_area and the
-            # review table/submit button in the same script run, so by
-            # the time _submit_items runs, that widget may already be
-            # instantiated this run — Streamlit forbids writing to a
-            # widget's session_state key after that point. render_parse_tab
-            # consumes this flag at the very top of its next run, before
-            # any text_area exists yet.
-            st.session_state[f"{key_prefix}_paste_input_pending_clear"] = True
+        # The paste box is left alone on success — staff clear it themselves
+        # with the "Clear" button when they're ready for the next delivery,
+        # rather than it disappearing out from under them automatically.
         # No status_key message here — the toast plus the "Submission
         # results" section below already cover success; a persistent box
         # repeating the same thing was redundant. Explicitly cleared (not
@@ -829,13 +815,6 @@ def render_parse_tab(
         st.subheader(subheader)
     if caption:
         st.caption(caption)
-
-    # Must run before the paste text_area is instantiated anywhere below
-    # (classic or SKIP REVIEW) — see the comment on this flag's write
-    # site in _submit_items for why it's deferred to here instead of
-    # cleared directly at submit time.
-    if st.session_state.pop(f"{key_prefix}_paste_input_pending_clear", False):
-        st.session_state[f"{key_prefix}_paste_input"] = ""
 
     selected_shop_id = None
     selected_supplier_id = None

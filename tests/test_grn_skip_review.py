@@ -132,8 +132,9 @@ def test_clean_parse_submits_immediately_with_no_read_or_confirm_buttons(grn_ski
     assert at.session_state["grn_status_message"] is None
     assert [t.value for t in at.toast] == ["Submitted GRN with 2 item(s)."]
     assert at.session_state["grn_parsed_items"] == []
-    # Paste box clears itself on a fully-successful submit.
-    assert at.text_area(key="grn_paste_input").value == ""
+    # The paste box is NOT auto-cleared on a successful submit — staff clear
+    # it themselves with the Clear button.
+    assert at.text_area(key="grn_paste_input").value == "anything"
 
 
 def test_clear_button_empties_the_paste_box(grn_skip_review):
