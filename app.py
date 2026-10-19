@@ -325,10 +325,18 @@ def _render_match_rows(
         chosen_id = ids_ordered[labels_ordered.index(chosen_label)]
         is_exact = bool(item.get("exact_match")) and chosen_id == matched_id
         status = "exact" if is_exact else ("unmatched" if chosen_id is None else "fuzzy")
+        # Duplicate-match flags come with their own explanation (which other
+        # line(s) matched the same product) instead of the generic "not
+        # found" message — that's the whole point of the flag, since the
+        # product WAS found, just by more than one line.
+        unmatched_caption = (
+            f"⚠️ {item['flag_reason']}" if item.get("flag_reason")
+            else f"⚠️ Not found: “{item.get('raw_text', '')}”"
+        )
 
         if compact:
             if status == "unmatched":
-                name_cell.caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
+                name_cell.caption(unmatched_caption)
             if status in _MATCH_STATUS_STYLE:
                 row_styles.append((name_cell_key, status))
 
@@ -340,7 +348,7 @@ def _render_match_rows(
 
         if not compact:
             if chosen_id is None:
-                cols[3].caption(f"⚠️ Not found: “{item.get('raw_text', '')}”")
+                cols[3].caption(unmatched_caption)
             elif is_exact:
                 cols[3].caption("✓ Exact match")
 

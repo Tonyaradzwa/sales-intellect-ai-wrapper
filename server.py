@@ -75,12 +75,36 @@ For each distinct product mentioned in the text:
    terms don't block a match), so a missing word like "Size" in the input
    (e.g. "Leotard Black 120" vs. the catalog's "Leotard Black Size 120") is
    still a valid match; don't require exact wording. If the first search
-   doesn't return a strong, confident match, retry with progressively
-   broader queries and merge the candidates from every attempt before
-   deciding: (a) the full name_query, (b) the same query with a trailing
-   number/size term dropped (e.g. "leotard black 15" -> "leotard black"),
-   then (c) just the core noun/category (e.g. "leotard black" -> "leotard").
-   Stop once you have a confident match or you've tried the core noun.
+   doesn't return a strong, confident match, retry with a broader query —
+   drop a trailing size number ("explorer vest navy 15" -> "explorer vest navy") or,
+   if still nothing, the core noun/category ("explorer vest navy" -> "explorer vest").
+
+   IMPORTANT — color and size are not safe to drop silently. Either one
+   may be how this catalog tells apart real, separate products (e.g.
+   "Swim Fin Blue-20391" vs. "Swim Fin-20390" vs. "Swim Fin
+   Green-20392"; "Explorer Vest Navy 120" vs. "Explorer Vest Navy 130"). Before
+   accepting any candidate found by a broadened query that dropped a
+   color or size the user mentioned:
+     - Check whether the catalog has OTHER products in the same family
+       distinguished by that same color/size (e.g. the broader search
+       turns up sibling products differing only by color or size).
+     - If such siblings exist and NONE of them is the specific color/size
+       the user mentioned, that exact variant most likely doesn't exist
+       yet. Do NOT substitute a different-colored/sized sibling or the
+       plain/generic product — call submit_result with matched_product_id
+       set to null instead, so staff can be told it's missing.
+     - Only accept a color/size-dropped match when there's no such
+       sibling evidence — i.e. this product family has just one SKU
+       regardless of color/size, so what the user typed was descriptive
+       text, not a real variant selector.
+
+   Examples:
+     - "Swim fin blue 1", catalog only has "Swim Fin-20390" (no blue
+       variant) -> flag it (matched_product_id: null).
+     - "Swim fin 1" (no color mentioned), catalog has "Swim Fin-20390"
+       -> confident match to Swim Fin-20390.
+     - "Swim fin blue 2", catalog has "Swim Fin Blue-20391" -> confident
+       match to that specific product, not the generic one.
 3. If the text references a GROUP of products rather than one specific item (e.g.
    "all pink leotards", "all the Sbart ones", "all Extra Large"), search and
    identify EVERY matching product, then call submit_result once per matching
@@ -119,12 +143,36 @@ For each distinct product mentioned in the text:
    terms don't block a match), so a missing word like "Size" in the input
    (e.g. "Leotard Black 120" vs. the catalog's "Leotard Black Size 120") is
    still a valid match; don't require exact wording. If the first search
-   doesn't return a strong, confident match, retry with progressively
-   broader queries and merge the candidates from every attempt before
-   deciding: (a) the full name_query, (b) the same query with a trailing
-   number/size term dropped (e.g. "leotard black 15" -> "leotard black"),
-   then (c) just the core noun/category (e.g. "leotard black" -> "leotard").
-   Stop once you have a confident match or you've tried the core noun.
+   doesn't return a strong, confident match, retry with a broader query —
+   drop a trailing size number ("explorer vest navy 15" -> "explorer vest navy") or,
+   if still nothing, the core noun/category ("explorer vest navy" -> "explorer vest").
+
+   IMPORTANT — color and size are not safe to drop silently. Either one
+   may be how this catalog tells apart real, separate products (e.g.
+   "Swim Fin Blue-20391" vs. "Swim Fin-20390" vs. "Swim Fin
+   Green-20392"; "Explorer Vest Navy 120" vs. "Explorer Vest Navy 130"). Before
+   accepting any candidate found by a broadened query that dropped a
+   color or size the user mentioned:
+     - Check whether the catalog has OTHER products in the same family
+       distinguished by that same color/size (e.g. the broader search
+       turns up sibling products differing only by color or size).
+     - If such siblings exist and NONE of them is the specific color/size
+       the user mentioned, that exact variant most likely doesn't exist
+       yet. Do NOT substitute a different-colored/sized sibling or the
+       plain/generic product — call submit_result with matched_product_id
+       set to null instead, so staff can be told it's missing.
+     - Only accept a color/size-dropped match when there's no such
+       sibling evidence — i.e. this product family has just one SKU
+       regardless of color/size, so what the user typed was descriptive
+       text, not a real variant selector.
+
+   Examples:
+     - "Swim fin blue 1", catalog only has "Swim Fin-20390" (no blue
+       variant) -> flag it (matched_product_id: null).
+     - "Swim fin 1" (no color mentioned), catalog has "Swim Fin-20390"
+       -> confident match to Swim Fin-20390.
+     - "Swim fin blue 2", catalog has "Swim Fin Blue-20391" -> confident
+       match to that specific product, not the generic one.
 3. If the text references a GROUP of products rather than one specific item (e.g.
    "all pink leotards", "all the Sbart ones", "all Extra Large"), search and
    identify EVERY matching product, then call submit_result once per matching
@@ -323,6 +371,37 @@ def _assign_codes(items, catalog, reserve_existing_item_codes=False):
                 item["code"] = suggested
                 if suggested:
                     used_codes.add(suggested)
+
+    return items
+
+
+def _flag_duplicate_matches(items):
+    """If two or more resolved lines matched the SAME product, that's almost
+    always a matching mistake (e.g. two different variants both collapsing
+    onto the same fallback product) rather than a legitimate repeat — so
+    every line in the collision gets flagged exactly like an unmatched line
+    (matched_product_id cleared, blocking submit until staff fixes it),
+    instead of silently summing quantities into one line or submitting
+    several duplicate lines. Runs on the complete, final item list (fast
+    tiers + agent combined), since a collision can span across tiers.
+    """
+    by_product = {}
+    for item in items:
+        product_id = item.get("matched_product_id")
+        if product_id:
+            by_product.setdefault(product_id, []).append(item)
+
+    for product_id, group in by_product.items():
+        if len(group) < 2:
+            continue
+        for item in group:
+            others = [g["raw_text"] for g in group if g is not item]
+            item["matched_product_id"] = None
+            item["flag_reason"] = (
+                "Duplicate match — also matched by "
+                + ", ".join(f'“{o}”' for o in others)
+            )
+        timing.log("duplicate_matches_flagged", product_id=product_id, lines=len(group))
 
     return items
 
@@ -1076,6 +1155,7 @@ def parse():
             # keep working unmodified.
             with timing.timed("assign_codes"):
                 items = _assign_codes(resolved_items, catalog, reserve_existing_item_codes=True)
+            items = _flag_duplicate_matches(items)
             timing.log("PARSE REQUEST RESULT", items_returned=len(items))
             return jsonify({"items": items})
 
@@ -1100,6 +1180,7 @@ def parse():
                         mode, remaining_lines, index, resolved_items, progress_cb,
                     )
                     items = _assign_codes(items, catalog, reserve_existing_item_codes=True)
+                    items = _flag_duplicate_matches(items)
                     job_store.update_job(job_id, status="done", items=items, done=len(items))
                     timing.log("parse_job_done", job_id=job_id, items_returned=len(items))
                 except Exception as e:
