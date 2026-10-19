@@ -23,7 +23,7 @@ def _reset_catalog_state():
     server._catalog_state["products"] = None
     server._catalog_state["fetched_at"] = None
     server._catalog_state["index"] = None
-    server._catalog_state["checked_disk"] = False
+    server._catalog_state["cache_mtime"] = server._CACHE_MTIME_UNSET
 
 
 @pytest.fixture(autouse=True)

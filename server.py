@@ -482,7 +482,12 @@ def _find_exact_matches(index, lines):
 CATALOG_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_cache.json")
 
 _catalog_lock = threading.Lock()
-_catalog_state = {"products": None, "fetched_at": None, "index": None, "checked_disk": False}
+# Sentinel for "this process has never checked the cache file yet" —
+# distinct from None, which means "checked, and the file doesn't exist."
+# Collapsing those two into one None would mean a process that starts with
+# no cache file never logs/initializes anything (None == None forever).
+_CACHE_MTIME_UNSET = object()
+_catalog_state = {"products": None, "fetched_at": None, "index": None, "cache_mtime": _CACHE_MTIME_UNSET}
 
 NO_CATALOG_CACHE_MESSAGE = 'No catalog cache found on server. Click "Refresh Catalog" to load it.'
 
@@ -524,22 +529,49 @@ def _load_catalog_from_file():
     return data.get("products"), data.get("fetched_at")
 
 
+def _cache_file_mtime():
+    try:
+        return os.path.getmtime(CATALOG_CACHE_PATH)
+    except OSError:
+        return None
+
+
 def get_catalog():
-    """Returns (products, fetched_at). Checks the cache file at most once per
-    process (then serves from memory). Never fetches live on its own — if no
+    """Returns (products, fetched_at). Checks the cache file's mtime on every
+    call (a cheap stat(), not a read) and only re-reads/rebuilds the index
+    when it's changed since this process last saw it — which is how a
+    worker process picks up a refresh done by a *different* gunicorn worker,
+    without needing a restart (each worker has its own independent copy of
+    _catalog_state; checking mtime every call, instead of once per process,
+    is what makes them converge). Never fetches live on its own — if no
     cache file exists yet, returns (None, None) rather than hitting the API;
     only POST /catalog/refresh (refresh_catalog(), below) does a live fetch.
     """
     with _catalog_lock:
-        if not _catalog_state["checked_disk"]:
-            loaded = _load_catalog_from_file()
+        current_mtime = _cache_file_mtime()
+        if current_mtime != _catalog_state["cache_mtime"]:
+            previously_loaded = _catalog_state["cache_mtime"] is not _CACHE_MTIME_UNSET
+            loaded = _load_catalog_from_file() if current_mtime is not None else None
             if loaded is not None:
                 _catalog_state["products"], _catalog_state["fetched_at"] = loaded
                 _catalog_state["index"] = CatalogIndex(_catalog_state["products"])
-                timing.log("catalog_loaded_from_file", products=len(_catalog_state["products"]))
+                timing.log(
+                    "catalog_loaded_from_file",
+                    products=len(_catalog_state["products"]), mtime=current_mtime,
+                )
             else:
+                _catalog_state["products"] = None
+                _catalog_state["fetched_at"] = None
+                _catalog_state["index"] = None
                 timing.log("catalog_cache_file_not_found")
-            _catalog_state["checked_disk"] = True
+            if previously_loaded:
+                # The file changed on disk since this process last loaded
+                # it — i.e. another worker refreshed it. This process's own
+                # lookup cache may hold product ids resolved against the
+                # old snapshot, which are no longer guaranteed valid.
+                _lookup_cache.clear()
+                timing.log("lookup_cache_cleared (catalog changed on disk)")
+            _catalog_state["cache_mtime"] = current_mtime
         return _catalog_state["products"], _catalog_state["fetched_at"]
 
 
@@ -559,7 +591,7 @@ def refresh_catalog():
     with _catalog_lock:
         _catalog_state["products"], _catalog_state["fetched_at"] = _fetch_and_store_catalog()
         _catalog_state["index"] = CatalogIndex(_catalog_state["products"])
-        _catalog_state["checked_disk"] = True
+        _catalog_state["cache_mtime"] = _cache_file_mtime()
         _lookup_cache.clear()
         timing.log("lookup_cache_cleared (catalog refreshed)")
         return _catalog_state["products"], _catalog_state["fetched_at"]

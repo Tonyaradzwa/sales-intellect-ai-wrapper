@@ -48,12 +48,17 @@ def client(monkeypatch, jobs_dir):
     yield server.app.test_client()
 
 
-def _set_catalog(monkeypatch, catalog):
+def _set_catalog(monkeypatch, catalog, tmp_path):
+    # Point CATALOG_CACHE_PATH at a file that doesn't exist, so get_catalog()'s
+    # per-call mtime check sees a stable "no file" (None) on every call and
+    # never tries to reload over this injected catalog — independent of
+    # whatever real catalog_cache.json happens to sit in the repo checkout.
+    monkeypatch.setattr(server, "CATALOG_CACHE_PATH", str(tmp_path / "catalog_cache.json"))
     monkeypatch.setattr(server, "_catalog_state", {
         "products": catalog,
         "fetched_at": "2026-01-01T00:00:00",
         "index": server.CatalogIndex(catalog),
-        "checked_disk": True,
+        "cache_mtime": None,
     })
 
 
@@ -67,11 +72,11 @@ def _wait_for_job(job_id, timeout=5):
     raise AssertionError(f"job {job_id} did not finish within {timeout}s")
 
 
-def test_fully_resolved_parse_has_no_job_id(monkeypatch, client):
+def test_fully_resolved_parse_has_no_job_id(monkeypatch, client, tmp_path):
     """Every line resolved by the fast tiers -> same response shape as
     before this feature existed, so existing frontend code/tests that only
     know {"items": [...]} keep working unmodified."""
-    _set_catalog(monkeypatch, _catalog(("Cap Large Black", "C001")))
+    _set_catalog(monkeypatch, _catalog(("Cap Large Black", "C001")), tmp_path)
 
     resp = client.post("/parse", json={"text": "Cap large black 5", "mode": "goods_received"})
 
@@ -82,13 +87,13 @@ def test_fully_resolved_parse_has_no_job_id(monkeypatch, client):
     assert data["items"][0]["matched_product_id"] == "p1"
 
 
-def test_unresolved_line_spawns_a_job_that_completes(monkeypatch, client):
+def test_unresolved_line_spawns_a_job_that_completes(monkeypatch, client, tmp_path):
     async def fake_query(prompt, options):
         return
         yield  # pragma: no cover - no-op agent, matches test_product_matching.py's convention
 
     monkeypatch.setattr(server, "query", fake_query)
-    _set_catalog(monkeypatch, _catalog(("Widget Blue Deluxe", "B001")))
+    _set_catalog(monkeypatch, _catalog(("Widget Blue Deluxe", "B001")), tmp_path)
 
     resp = client.post("/parse", json={"text": "Totally Unknown Thing 2", "mode": "goods_received"})
 
@@ -103,13 +108,13 @@ def test_unresolved_line_spawns_a_job_that_completes(monkeypatch, client):
     assert job["items"] == []  # the no-op fake agent never resolves it
 
 
-def test_mixed_resolved_and_unresolved_reports_correct_total_and_done(monkeypatch, client):
+def test_mixed_resolved_and_unresolved_reports_correct_total_and_done(monkeypatch, client, tmp_path):
     async def fake_query(prompt, options):
         return
         yield  # pragma: no cover
 
     monkeypatch.setattr(server, "query", fake_query)
-    _set_catalog(monkeypatch, _catalog(("Cap Large Black", "C001")))
+    _set_catalog(monkeypatch, _catalog(("Cap Large Black", "C001")), tmp_path)
 
     resp = client.post(
         "/parse",
@@ -128,13 +133,13 @@ def test_mixed_resolved_and_unresolved_reports_correct_total_and_done(monkeypatc
     assert job["items"][0]["matched_product_id"] == "p1"
 
 
-def test_agent_exception_marks_job_as_error(monkeypatch, client):
+def test_agent_exception_marks_job_as_error(monkeypatch, client, tmp_path):
     async def failing_query(prompt, options):
         raise RuntimeError("agent exploded")
         yield  # pragma: no cover
 
     monkeypatch.setattr(server, "query", failing_query)
-    _set_catalog(monkeypatch, _catalog(("Widget Blue Deluxe", "B001")))
+    _set_catalog(monkeypatch, _catalog(("Widget Blue Deluxe", "B001")), tmp_path)
 
     resp = client.post("/parse", json={"text": "Totally Unknown Thing 2", "mode": "goods_received"})
     job_id = resp.get_json()["job_id"]
@@ -149,7 +154,7 @@ def test_job_status_for_unknown_job_is_404(client):
     assert resp.status_code == 404
 
 
-def test_new_products_mode_always_goes_through_the_job_path(monkeypatch, client):
+def test_new_products_mode_always_goes_through_the_job_path(monkeypatch, client, tmp_path):
     """new_products has no catalog to fast-match against, so every call
     needs the agent -- unlike goods_received/product_updates, there's no
     "fully resolved, no job needed" case for this mode."""
@@ -158,7 +163,7 @@ def test_new_products_mode_always_goes_through_the_job_path(monkeypatch, client)
         yield  # pragma: no cover
 
     monkeypatch.setattr(server, "query", fake_query)
-    _set_catalog(monkeypatch, _catalog(("Existing Product", "E001")))
+    _set_catalog(monkeypatch, _catalog(("Existing Product", "E001")), tmp_path)
 
     resp = client.post(
         "/parse", json={"text": "add new product: Kickboards Large, price 8.50", "mode": "new_products"},

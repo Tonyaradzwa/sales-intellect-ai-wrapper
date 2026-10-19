@@ -41,12 +41,17 @@ def client(fake_si_client, jobs_dir):
     return server.app.test_client()
 
 
-def _set_catalog(monkeypatch, products):
+def _set_catalog(monkeypatch, products, tmp_path):
+    # Point CATALOG_CACHE_PATH at a file that doesn't exist, so get_catalog()'s
+    # per-call mtime check sees a stable "no file" (None) and never reloads
+    # over this injected catalog with whatever real catalog_cache.json
+    # happens to sit in the repo checkout.
+    monkeypatch.setattr(server, "CATALOG_CACHE_PATH", str(tmp_path / "catalog_cache.json"))
     monkeypatch.setattr(server, "_catalog_state", {
         "products": products,
         "fetched_at": "2026-01-01T00:00:00",
         "index": server.CatalogIndex(products),
-        "checked_disk": True,
+        "cache_mtime": None,
     })
 
 
@@ -60,8 +65,8 @@ def _wait_for_job(job_id, timeout=5):
     raise AssertionError(f"job {job_id} did not finish within {timeout}s")
 
 
-def test_grn_only_submission_has_no_job_id(client, fake_si_client, monkeypatch):
-    _set_catalog(monkeypatch, [{"product_id": "p1", "name": "Item A", "code": "A001", "cost": 2}])
+def test_grn_only_submission_has_no_job_id(client, fake_si_client, monkeypatch, tmp_path):
+    _set_catalog(monkeypatch, [{"product_id": "p1", "name": "Item A", "code": "A001", "cost": 2}], tmp_path)
     fake_si_client.create_grn.return_value = {"grn_id": "g1"}
 
     resp = client.post("/confirm", json={
@@ -106,8 +111,8 @@ def test_stock_update_only_spawns_job_with_real_per_item_progress(client, fake_s
     assert fake_si_client.adjust_inventory.call_count == 3
 
 
-def test_mixed_other_items_and_grn_reports_combined_total_and_progress(client, fake_si_client, monkeypatch):
-    _set_catalog(monkeypatch, [{"product_id": "p2", "name": "Item B", "code": "B001", "cost": 1}])
+def test_mixed_other_items_and_grn_reports_combined_total_and_progress(client, fake_si_client, monkeypatch, tmp_path):
+    _set_catalog(monkeypatch, [{"product_id": "p2", "name": "Item B", "code": "B001", "cost": 1}], tmp_path)
     fake_si_client.adjust_inventory.return_value = {"ok": True}
     fake_si_client.create_grn.return_value = {"grn_id": "g1"}
 
