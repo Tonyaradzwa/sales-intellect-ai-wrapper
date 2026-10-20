@@ -39,10 +39,10 @@ with center:
     if st.button("Submit GRN", key=GRN_KEY, use_container_width=True):
         st.switch_page("pages/goods_received.py")
 
-    if st.button("Inventory Updates", key=INV_KEY, use_container_width=True):
+    if st.button("Adjust Stock Counts", key=INV_KEY, use_container_width=True):
         st.switch_page("pages/inventory_updates.py")
 
     st.button(
-        "Bulk Product Upload", key=BULK_KEY, use_container_width=True,
+        "Add New Products", key=BULK_KEY, use_container_width=True,
         disabled=True, help="Coming soon",
     )

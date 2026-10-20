@@ -750,19 +750,59 @@ def _render_paste_box(key_prefix, button_label, button_key):
 
 
 def _render_paste_box_multi(key_prefix, buttons):
-    """_render_paste_textarea() + several action buttons side by side, for
-    flows where the chosen button itself carries meaning (e.g. Inventory
-    Updates' increase/decrease/fixed-quantity intent) instead of there
-    being one single "submit" action.
+    """_render_paste_textarea() + several green action buttons side by
+    side, for flows where the chosen button itself carries meaning (e.g.
+    Inventory Updates' increase/decrease/fixed-quantity intent) instead of
+    there being one single "submit" action.
 
     buttons: [(label, key, value), ...]. Returns (paste_text, value) for
     whichever button was clicked this run, or (paste_text, None).
     """
     paste_text = _render_paste_textarea(key_prefix)
+
+    row_key = f"{key_prefix}_action_row"
+    button_rules = "\n".join(
+        f"""
+        .st-key-{key} button {{
+            background-color: #16a34a;
+            border-color: #16a34a;
+            color: #ffffff;
+        }}
+        .st-key-{key} button:hover {{
+            background-color: #15803d;
+            border-color: #15803d;
+            color: #ffffff;
+        }}
+        """
+        for _, key, _ in buttons
+    )
+    st.markdown(
+        f"""
+        <style>
+        /* st.columns() stacks into one column below Streamlit's own
+           mobile-width breakpoint — a flex row here instead, so these
+           buttons only wrap when there truly isn't enough width, not
+           whenever Streamlit's column breakpoint says so. */
+        .st-key-{row_key} {{
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }}
+        .st-key-{row_key} > div[data-testid="stElementContainer"] {{
+            flex: 1 1 140px;
+        }}
+        {button_rules}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     clicked_value = None
-    for col, (label, key, value) in zip(st.columns(len(buttons)), buttons):
-        if col.button(label, key=key, use_container_width=True):
-            clicked_value = value
+    with st.container(key=row_key):
+        for label, key, value in buttons:
+            if st.button(label, key=key, use_container_width=True):
+                clicked_value = value
     return paste_text, clicked_value
 
 
@@ -1133,9 +1173,9 @@ def render_parse_tab(
             st.rerun()
         elif is_inventory_mode:
             paste_text, clicked_mode = _render_paste_box_multi(key_prefix, [
-                ("Bulk Increase Stock", f"{key_prefix}_inc_btn", "increase"),
-                ("Bulk Decrease Stock", f"{key_prefix}_dec_btn", "decrease"),
-                ("Fixed Quantity", f"{key_prefix}_fixed_btn", "fixed"),
+                ("Increase stock", f"{key_prefix}_inc_btn", "increase"),
+                ("Decrease stock", f"{key_prefix}_dec_btn", "decrease"),
+                ("Set stock", f"{key_prefix}_fixed_btn", "fixed"),
             ])
 
             if clicked_mode and paste_text:

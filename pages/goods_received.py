@@ -12,6 +12,7 @@ core.render_parse_tab(
     client, catalog_products=catalog_products,
     key_prefix="grn",
     mode="goods_received",
+    subheader="Submit GRN",
     # Implementation notes: all items in one submission are recorded as a
     # single GRN, and payment method is fixed to Cash — the only one
     # currently supported, see _GRN_CASH_PAYMENT_METHOD_ID in server.py.

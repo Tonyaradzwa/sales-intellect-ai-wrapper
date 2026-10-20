@@ -14,7 +14,7 @@ core.render_parse_tab(
     client, catalog_products=catalog_products,
     key_prefix="bulk",
     mode="new_products",
-    subheader="Bulk Product Upload",
+    subheader="Add New Products",
     caption=(
         "Paste a raw WhatsApp message listing brand new products to add "
         "(e.g. \"add new product: Kickboards Large, price 8.50\"). No shop "
