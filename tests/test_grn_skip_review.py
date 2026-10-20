@@ -113,6 +113,8 @@ def test_clean_parse_submits_immediately_with_no_read_or_confirm_buttons(grn_ski
     grn_skip_review["parse_items"] = PARSE_CLEAN
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
     _start(at)
 
     labels = [b.label for b in at.button]
@@ -142,6 +144,8 @@ def test_clear_button_empties_the_paste_box(grn_skip_review):
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
     _start(at)
 
     at.text_area(key="grn_paste_input").set_value("some pasted text").run()
@@ -159,6 +163,8 @@ def test_flagged_item_blocks_submit_until_fixed_then_submits_full_batch(grn_skip
 
     grn_skip_review["parse_items"] = PARSE_DIRTY
     at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
     at.run()
     _start(at)
 

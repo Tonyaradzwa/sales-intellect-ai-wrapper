@@ -87,7 +87,7 @@ def test_grn_only_submission_has_no_job_id(client, fake_si_client, monkeypatch, 
 
 
 def test_stock_update_only_spawns_job_with_real_per_item_progress(client, fake_si_client, monkeypatch):
-    fake_si_client.adjust_inventory.side_effect = lambda shop_id, product_id, qty: {"ok": True}
+    fake_si_client.set_inventory.side_effect = lambda shop_id, product_id, qty: {"ok": True}
 
     resp = client.post("/confirm", json={
         "shop_id": "shop-1",
@@ -108,12 +108,12 @@ def test_stock_update_only_spawns_job_with_real_per_item_progress(client, fake_s
     assert job["total"] == 3
     assert len(job["results"]) == 3
     assert all(r["success"] for r in job["results"])
-    assert fake_si_client.adjust_inventory.call_count == 3
+    assert fake_si_client.set_inventory.call_count == 3
 
 
 def test_mixed_other_items_and_grn_reports_combined_total_and_progress(client, fake_si_client, monkeypatch, tmp_path):
     _set_catalog(monkeypatch, [{"product_id": "p2", "name": "Item B", "code": "B001", "cost": 1}], tmp_path)
-    fake_si_client.adjust_inventory.return_value = {"ok": True}
+    fake_si_client.set_inventory.return_value = {"ok": True}
     fake_si_client.create_grn.return_value = {"grn_id": "g1"}
 
     resp = client.post("/confirm", json={
@@ -134,7 +134,7 @@ def test_mixed_other_items_and_grn_reports_combined_total_and_progress(client, f
     assert job["done"] == 2
     assert len(job["results"]) == 2
     fake_si_client.create_grn.assert_called_once()
-    fake_si_client.adjust_inventory.assert_called_once()
+    fake_si_client.set_inventory.assert_called_once()
 
 
 def test_failed_item_is_recorded_but_job_still_completes(client, fake_si_client):
@@ -155,7 +155,7 @@ def test_job_backed_confirm_calls_si_client_exactly_once_per_item(client, fake_s
     """Regression check for the lost-serialization risk the plan flagged:
     the background thread must process other_items sequentially, one API
     call per item, not double-call or skip any."""
-    fake_si_client.adjust_inventory.return_value = {"ok": True}
+    fake_si_client.set_inventory.return_value = {"ok": True}
 
     resp = client.post("/confirm", json={
         "shop_id": "shop-1",
@@ -168,5 +168,5 @@ def test_job_backed_confirm_calls_si_client_exactly_once_per_item(client, fake_s
 
     job = _wait_for_job(resp.get_json()["job_id"])
     assert job["status"] == "done"
-    assert fake_si_client.adjust_inventory.call_count == 5
+    assert fake_si_client.set_inventory.call_count == 5
     assert len(job["results"]) == 5

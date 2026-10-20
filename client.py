@@ -98,24 +98,32 @@ class SalesIntellectClient:
     def create_grn(self, data):
         return self._request("POST", "/grn", json=data)
 
-    def get_inventory(self, shop_id):
-        """Fetch every inventory level for a shop, paging like list_products().
+    def get_inventory(self, shop_id, product_ids=None):
+        """Fetch inventory levels for a shop, optionally narrowed to specific
+        products, paging like list_products().
 
-        Same API quirk as /products: shop_ids/limit/cursor must be sent as a
-        JSON body on this GET request, not query params, or the API caps
-        results at a default page of 10 (confirmed empirically — query
-        params silently returned only the 10 lowest product codes,
-        regardless of the requested shop). cursor keeps minting a new
+        Same API quirk as /products: shop_ids/product_ids/limit/cursor must
+        be sent as a JSON body on this GET request, not query params, or the
+        API caps results at a default page of 10. On top of that — confirmed
+        empirically — shop_ids/product_ids only actually filter when sent as
+        a single comma-joined string (e.g. "id1,id2"), not a JSON array: a
+        JSON array is silently ignored and the API returns everything
+        (every product at every shop) instead. cursor keeps minting a new
         non-null value past the last page too, so termination is on an
         empty inventory_levels list only.
         """
-        with timing.section("FETCHING INVENTORY (get_inventory)", shop_id=shop_id):
+        with timing.section("FETCHING INVENTORY (get_inventory)", shop_id=shop_id, product_ids=product_ids):
             levels = []
             cursor = None
             page_num = 0
             while True:
                 page_num += 1
-                body = {"shop_ids": [shop_id], "limit": PAGE_LIMIT}
+                body = {"shop_ids": shop_id, "limit": PAGE_LIMIT}
+                if product_ids:
+                    body["product_ids"] = (
+                        ",".join(product_ids) if isinstance(product_ids, (list, tuple, set))
+                        else product_ids
+                    )
                 if cursor is not None:
                     body["cursor"] = cursor
                 page = self._request("GET", "/inventory", json=body)
@@ -138,12 +146,17 @@ class SalesIntellectClient:
 
     def adjust_inventory(self, shop_id, product_id, delta):
         with timing.section("ADJUST INVENTORY", shop_id=shop_id, product_id=product_id, delta=delta):
-            levels = self.get_inventory(shop_id)
+            levels = self.get_inventory(shop_id, product_ids=[product_id])
             if isinstance(levels, dict):
                 levels = levels.get("inventory_levels", [])
             current = None
             for level in levels:
-                if level.get("product_id") == product_id:
+                # Must check shop_id too, not just product_id — without the
+                # product_ids filter above actually narrowing results, this
+                # loop could otherwise pick up another shop's stock count by
+                # list-order luck (confirmed happening before product_ids
+                # filtering was fixed to use a comma-joined string).
+                if level.get("product_id") == product_id and level.get("shop_id") == shop_id:
                     current = level.get("in_stock")
                     break
             if current is None:

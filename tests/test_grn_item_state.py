@@ -135,6 +135,8 @@ def _submit_one_grn(at, shop_label, paste_text):
 def test_second_branch_grn_does_not_include_first_branchs_items(confirm_payloads):
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
 
     _submit_one_grn(at, "Branch A", "PASTE_A")
     assert len(confirm_payloads) == 1
@@ -161,6 +163,8 @@ def test_second_branch_grn_does_not_include_first_branchs_items(confirm_payloads
 def test_clear_button_empties_the_paste_box(confirm_payloads):
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
 
     at.text_area(key="grn_paste_input").set_value("some pasted text").run()
     assert at.text_area(key="grn_paste_input").value == "some pasted text"
@@ -186,6 +190,8 @@ def test_failed_confirm_keeps_items(confirm_payloads, monkeypatch):
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
 
     at.selectbox(key="grn_shop").select("Branch A").run()
     at.selectbox(key="grn_supplier").select("Supplier One").run()
@@ -203,6 +209,8 @@ def test_unmatched_item_blocks_submit(confirm_payloads):
     from streamlit.testing.v1.errors import AppTestError
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
     at.run()
 
     at.selectbox(key="grn_shop").select("Branch A").run()

@@ -1245,12 +1245,48 @@ def refresh_catalog_route():
     return jsonify({"products": products, "fetched_at": fetched_at, "count": len(products)})
 
 
+@app.route("/inventory/levels", methods=["POST"])
+def inventory_levels_route():
+    """Current stock for a shop, narrowed to specific products — used by the
+    Inventory Updates tab's review table to show/recompute "Current stock"
+    and "Resulting stock". Always a live call (no caching here, unlike
+    /catalog): stock moves with every sale, so the frontend refetches this
+    on shop change and again right before Confirm rather than trusting a
+    stale snapshot.
+    """
+    if si_client is None:
+        return jsonify({"error": si_client_error}), 500
+
+    body = request.get_json(force=True, silent=True) or {}
+    shop_id = body.get("shop_id")
+    product_ids = body.get("product_ids") or []
+
+    if not shop_id:
+        return jsonify({"error": "shop_id is required."}), 400
+    if not product_ids:
+        return jsonify({"levels": {}})
+
+    try:
+        levels = si_client.get_inventory(shop_id, product_ids=product_ids)
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch inventory levels: {e}"}), 502
+
+    by_product = {
+        level.get("product_id"): level.get("in_stock")
+        for level in levels if level.get("shop_id") == shop_id
+    }
+    return jsonify({"levels": by_product})
+
+
 def _process_other_item(item, shop_id, shop_name):
     """Writes one stock_update/new_product item to Sales Intellect and
     returns its results-list entry (success, or a staff-facing failure
     message). Extracted from the /confirm route's per-item loop so the
     exact same logic runs whether that loop executes synchronously or
     inside a background job thread (see confirm() below).
+
+    stock_update writes item["quantity"] as the absolute final stock level,
+    not a delta — see the comment at that branch below.
     """
     action = item.get("action")
     raw_text = item.get("raw_text", "")
@@ -1288,13 +1324,18 @@ def _process_other_item(item, shop_id, shop_name):
                     payload["cost"] = price
                 result = si_client.upsert_product(payload)
             elif action == "stock_update":
+                # `quantity` here is the already-resolved absolute resulting
+                # stock (the Inventory Updates tab computes current ± delta
+                # or the fixed target itself, and refetches current stock
+                # right before Confirm) — write it directly, no server-side
+                # read-modify-write needed.
                 product_id = item.get("matched_product_id")
                 quantity = item.get("quantity")
                 if not product_id:
                     raise Exception("No matched_product_id set for stock update.")
                 if quantity is None:
                     raise Exception("No quantity set for stock update.")
-                result = si_client.adjust_inventory(shop_id, product_id, int(quantity))
+                result = si_client.set_inventory(shop_id, product_id, int(quantity))
             else:
                 raise Exception(f"Unknown action: {action!r}")
 

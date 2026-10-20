@@ -93,6 +93,8 @@ def test_supplier_dropdown_hidden_and_na_used_by_default(confirm_payloads, monke
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
     assert not at.exception, at.exception
 
     assert not any(s.key == "grn_supplier" for s in at.selectbox)
@@ -110,6 +112,8 @@ def test_supplier_dropdown_shown_when_flag_disabled(confirm_payloads, monkeypatc
     monkeypatch.setenv("SI_GRN_DEFAULT_SUPPLIER_TO_NA", "false")
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
     at.run()
     assert not at.exception, at.exception
 
@@ -132,6 +136,8 @@ def test_refresh_suppliers_button_hidden_by_default(confirm_payloads, monkeypatc
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
     at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
     assert not at.exception, at.exception
 
     labels = [b.label for b in at.button]
@@ -143,6 +149,8 @@ def test_refresh_suppliers_button_shown_when_flag_enabled(confirm_payloads, monk
     monkeypatch.setenv("SI_SHOW_REFRESH_SUPPLIERS", "true")
 
     at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
     at.run()
     assert not at.exception, at.exception
 
