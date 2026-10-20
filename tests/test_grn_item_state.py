@@ -154,10 +154,10 @@ def test_second_branch_grn_does_not_include_first_branchs_items(confirm_payloads
 
     # Session state itself should be empty after a successful submit.
     assert at.session_state["grn_parsed_items"] == []
-    # The paste box is NOT auto-cleared on a successful submit — staff clear
-    # it themselves with the Clear button when they're ready for the next
-    # delivery.
-    assert at.text_area(key="grn_paste_input").value == "PASTE_B"
+    # Paste box clears itself on a fully-successful submit too (classic
+    # flow renders the paste box and the confirm button in the same run,
+    # unlike SKIP REVIEW — this is the trickier case to get right).
+    assert at.text_area(key="grn_paste_input").value == ""
 
 
 def test_clear_button_empties_the_paste_box(confirm_payloads):
