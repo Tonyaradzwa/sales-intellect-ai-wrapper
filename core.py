@@ -8,7 +8,7 @@ for everything that used to live in one big app.py.
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 import requests
 import streamlit as st
@@ -549,7 +549,7 @@ def _render_inventory_rows(items, key_prefix, product_lookup, shop_id):
 def _submit_items(
     key_prefix, items_key, status_key, items,
     selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
-    label="item",
+    label="item", grn_date=None,
 ):
     """POSTs /confirm for a batch of (already-flag-free) items and updates
     status_key/confirm_results accordingly. Shared by every Confirm/Submit
@@ -578,6 +578,13 @@ def _submit_items(
         return
 
     payload_items = [{k: v for k, v in it.items() if k != "_rid"} for it in items]
+    confirm_body = {
+        "shop_id": selected_shop_id,
+        "supplier_id": selected_supplier_id,
+        "items": payload_items,
+    }
+    if grn_date is not None:
+        confirm_body["grn_date"] = grn_date.isoformat()
     run_id = timing.new_run_id()
     with timing.section(
         "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
@@ -587,11 +594,7 @@ def _submit_items(
                 with timing.timed("http_post_confirm"):
                     resp = requests.post(
                         f"{BACKEND_URL}/confirm",
-                        json={
-                            "shop_id": selected_shop_id,
-                            "supplier_id": selected_supplier_id,
-                            "items": payload_items,
-                        },
+                        json=confirm_body,
                         timeout=30,
                     )
         except Exception as e:
@@ -923,6 +926,7 @@ def _run_parse_flow(mode, text):
 def _render_grn_skip_review(
     key_prefix, mode, items_key, status_key, catalog_products,
     selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
+    selected_grn_date,
 ):
     """GRN's SKIP REVIEW flow (SI_GRN_SKIP_REVIEW=true): no read-then-review
     step — a single "Submit GRN" button parses the paste and, if every item
@@ -970,7 +974,7 @@ def _render_grn_skip_review(
             _submit_items(
                 key_prefix, items_key, status_key, loading_ui.busy_payload(submit_busy_key, "items"),
                 selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
-                label="GRN",
+                label="GRN", grn_date=selected_grn_date,
             )
             loading_ui.clear_busy(submit_busy_key, "items")
             st.rerun()
@@ -1016,7 +1020,7 @@ def _render_grn_skip_review(
                     key_prefix, items_key, status_key, new_items,
                     selected_shop_id, selected_supplier_id,
                     show_shop_selector, show_supplier_selector,
-                    label="GRN",
+                    label="GRN", grn_date=selected_grn_date,
                 )
         loading_ui.clear_busy(submit_busy_key, "paste_text")
         st.rerun()
@@ -1123,6 +1127,14 @@ def render_parse_tab(
                     )
                     selected_supplier_id = supplier_options.get(supplier_label)
 
+    selected_grn_date = None
+    if mode == "goods_received":
+        # Defaults to today but is editable — click it to backdate a GRN
+        # for a delivery that was actually received earlier.
+        selected_grn_date = st.date_input(
+            "GRN date", value=date.today(), max_value=date.today(), key=f"{key_prefix}_date",
+        )
+
     items_key = f"{key_prefix}_parsed_items"
     status_key = f"{key_prefix}_status_message"
     if status_key not in st.session_state:
@@ -1138,7 +1150,7 @@ def render_parse_tab(
         _render_grn_skip_review(
             key_prefix, mode, items_key, status_key, catalog_products,
             selected_shop_id, selected_supplier_id,
-            show_shop_selector, show_supplier_selector,
+            show_shop_selector, show_supplier_selector, selected_grn_date,
         )
     else:
         is_inventory_mode = mode == "product_updates"
@@ -1207,7 +1219,7 @@ def render_parse_tab(
                 _submit_items(
                     key_prefix, items_key, status_key, loading_ui.busy_payload(confirm_busy_key, "items"),
                     selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
-                    label=confirm_label,
+                    label=confirm_label, grn_date=selected_grn_date,
                 )
                 loading_ui.clear_busy(confirm_busy_key, "items")
                 st.rerun()

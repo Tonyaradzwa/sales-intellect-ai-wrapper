@@ -1360,6 +1360,7 @@ def confirm():
     shop_id = body.get("shop_id")
     supplier_id = body.get("supplier_id")
     items = body.get("items")
+    grn_date = body.get("grn_date")
 
     if not isinstance(items, list) or not items:
         return jsonify({"error": "items must be a non-empty list."}), 400
@@ -1393,7 +1394,7 @@ def confirm():
             results = []
             if grn_items:
                 with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
-                    results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name))
+                    results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date))
             return jsonify({"results": results})
 
         # other_items has a real per-item server-side loop (each one is a
@@ -1417,7 +1418,7 @@ def confirm():
 
                     if grn_items:
                         with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
-                            results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name))
+                            results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date))
                         job_store.update_job(job_id, done=total)
 
                     job_store.update_job(job_id, status="done", results=results)
@@ -1492,10 +1493,13 @@ _GRN_TYPE = "DIRECT"
 _GRN_CASH_PAYMENT_METHOD_ID = "TldVZ1lzSnVUejBPRjN5RVVkWnAxdz09"
 
 
-def _submit_grn(grn_items, shop_id, supplier_id, shop_name):
+def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None):
     """Create one GRN covering every goods_received item, mirroring how a
     real goods-received note bundles everything from one delivery together
     (rather than one API call per line item, like stock_update does).
+
+    grn_date: ISO date string chosen in the UI (defaults to today there);
+    falls back to today here too in case an older/other caller omits it.
     """
     results = []
     incomplete = [it for it in grn_items if not it.get("matched_product_id") or it.get("quantity") is None]
@@ -1548,7 +1552,7 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name):
         payload = {
             "supplier_id": supplier_id,
             "shop_id": shop_id,
-            "grn_date": date.today().isoformat(),
+            "grn_date": grn_date or date.today().isoformat(),
             "payment_method_id": _GRN_CASH_PAYMENT_METHOD_ID,
             "supplier_invoice_no": "",
             "addition_information": "",
