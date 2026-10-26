@@ -886,7 +886,7 @@ def _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items, pro
                 results = _search_catalog(index, args.get("query", ""))
                 _merge_candidates(results)
                 text_out = json.dumps(results) if results else "No matching products found."
-            timing.log("  -> results", count=len(results))
+            timing.log("  -> results", count=len(results), candidates=results)
             return {"content": [{"type": "text", "text": text_out}]}
 
         tools = [search_products]
@@ -991,7 +991,7 @@ def _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items, pro
                         actions.log(
                             "tier_agent_miss",
                             raw_text=args["raw_text"], action="goods_received",
-                            candidates=len(candidates) or None,
+                            candidates=candidates or None,
                         )
                 return {"content": [{"type": "text", "text": "Recorded."}]}
 
@@ -1054,7 +1054,7 @@ def _run_parse_agent_remainder(mode, remaining_lines, index, resolved_items, pro
                         actions.log(
                             "tier_agent_miss",
                             raw_text=args["raw_text"], action="stock_update",
-                            candidates=len(candidates) or None,
+                            candidates=candidates or None,
                         )
                 return {"content": [{"type": "text", "text": "Recorded."}]}
 
