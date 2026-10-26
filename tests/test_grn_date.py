@@ -120,3 +120,24 @@ def test_grn_date_can_be_changed(confirm_payloads):
 
     assert len(confirm_payloads) == 1
     assert confirm_payloads[0]["grn_date"] == backdated.isoformat()
+
+
+def test_grn_date_resets_to_today_after_successful_submit(confirm_payloads):
+    at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
+    assert not at.exception, at.exception
+
+    backdated = date.today() - timedelta(days=3)
+    at.date_input(key="grn_date").set_value(backdated).run()
+
+    at.selectbox(key="grn_shop").select("Branch A").run()
+    at.text_area(key="grn_paste_input").set_value("anything")
+    at.button(key="grn_submit_btn").click().run()
+    assert not at.exception, at.exception
+
+    assert len(confirm_payloads) == 1
+    assert confirm_payloads[0]["grn_date"] == backdated.isoformat()
+    # The picker itself resets back to today, ready for the next delivery.
+    assert at.date_input(key="grn_date").value == date.today()

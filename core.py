@@ -678,6 +678,10 @@ def _submit_items(
             # consumes this flag at the very top of its next run, before
             # any text_area exists yet.
             st.session_state[f"{key_prefix}_paste_input_pending_clear"] = True
+            # Same deferred-flag reasoning as above — GRN's date picker
+            # resets back to today instead of carrying over into the next
+            # delivery's submission.
+            st.session_state[f"{key_prefix}_date_pending_reset"] = True
         # No status_key message here — the toast plus the "Submission
         # results" section below already cover success; a persistent box
         # repeating the same thing was redundant. Explicitly cleared (not
@@ -1077,6 +1081,8 @@ def render_parse_tab(
     # cleared directly at submit time.
     if st.session_state.pop(f"{key_prefix}_paste_input_pending_clear", False):
         st.session_state[f"{key_prefix}_paste_input"] = ""
+    if st.session_state.pop(f"{key_prefix}_date_pending_reset", False):
+        st.session_state[f"{key_prefix}_date"] = date.today()
 
     selected_shop_id = None
     selected_supplier_id = None
