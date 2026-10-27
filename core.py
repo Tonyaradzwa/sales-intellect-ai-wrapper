@@ -7,6 +7,7 @@ for everything that used to live in one big app.py.
 
 import os
 import time
+import urllib.parse
 import uuid
 from datetime import date, datetime
 
@@ -82,14 +83,20 @@ def require_client():
         st.stop()
 
 
-def _shop_options(shops):
+def _shop_list(shops):
+    """Normalizes list_shops()'s return value — a {"shops": [...]} dict in
+    practice — to a plain list of shop dicts."""
     if isinstance(shops, dict):
         for value in shops.values():
             if isinstance(value, list):
-                shops = value
-                break
+                return value
+        return []
+    return shops
+
+
+def _shop_options(shops):
     options = {}
-    for s in shops:
+    for s in _shop_list(shops):
         shop_id = s.get("id") or s.get("shop_id")
         name = s.get("shop_name") or s.get("name") or shop_id
         options[name] = shop_id
@@ -546,6 +553,79 @@ def _render_inventory_rows(items, key_prefix, product_lookup, shop_id):
     return edited_items, deleted_rid
 
 
+def _grn_whatsapp_text(shop_id):
+    """Looks up the GRN just submitted via GET /grn and formats it as plain
+    text simple enough to read clearly in a WhatsApp message: shop name and
+    GRN number up top, then each product with its quantity, nothing else.
+
+    POST /grn (create_grn) only ever returns a bare {"success": {...}} ack —
+    confirmed against the real API, no grn_number or grn_id in it — so the
+    only way to get the created GRN back is to look it up afterward. GET
+    /grn has no "most recent" or "by grn_id" filter either, only shop_ids/
+    grn_numbers/grn_status/date-range, so this fetches every GRN for the
+    shop and picks the highest grn_number: GRN numbers are allocated
+    sequentially, and we just created the newest one for this shop.
+    """
+    client = get_client()
+    grns = client.get_grn(shop_ids=shop_id)
+    if not grns:
+        return None
+
+    def _grn_num(g):
+        digits = "".join(ch for ch in g.get("grn_number", "") if ch.isdigit())
+        return int(digits) if digits else -1
+
+    grn = max(grns, key=_grn_num)
+
+    # GET /grn gives shop_id, not shop_name — reuses the same cached shop
+    # list the Shop dropdown already fetched, instead of a fresh API call.
+    shops = _session_cached("_cache_shops", client.list_shops, "Loading shop list…")
+    shop_name = next(
+        (s.get("shop_name") or s.get("name") for s in _shop_list(shops) if (s.get("id") or s.get("shop_id")) == shop_id),
+        None,
+    )
+
+    lines = [shop_name or shop_id, grn.get("grn_number", "GRN"), ""]
+    for item in grn.get("items", []):
+        qty = item.get("grn_qty", 0)
+        qty_str = f"{qty:g}" if isinstance(qty, (int, float)) else str(qty)
+        lines.append(f"{item.get('product_name', '')}    {qty_str}")
+    return "\n".join(lines)
+
+
+def _grn_whatsapp_link(key_prefix):
+    """The wa.me link for the just-submitted GRN (see _grn_whatsapp_text),
+    or None if there isn't one yet — i.e. nothing's been submitted this
+    session, or the last submit wasn't a clean GRN success. No phone number
+    in the link: wa.me opens WhatsApp's own contact picker with the message
+    pre-filled, so staff pick who to send it to rather than it going to a
+    fixed number.
+    """
+    copy_text = st.session_state.get(f"{key_prefix}_grn_copy_text")
+    if not copy_text:
+        return None
+    return "https://wa.me/?text=" + urllib.parse.quote(copy_text, safe="")
+
+
+def _render_submit_whatsapp_row(key_prefix, submit_disabled=False):
+    """"Submit GRN" and "Open in WhatsApp" side by side. Returns whether
+    Submit GRN was clicked this run.
+    """
+    submit_col, whatsapp_col = st.columns([1, 1])
+    with submit_col:
+        submit_clicked = st.button(
+            "Submit GRN", key=f"{key_prefix}_submit_btn", disabled=submit_disabled,
+            use_container_width=True,
+        )
+    with whatsapp_col:
+        wa_link = _grn_whatsapp_link(key_prefix)
+        st.link_button(
+            "Open in WhatsApp", wa_link or "https://wa.me/",
+            disabled=wa_link is None, use_container_width=True,
+        )
+    return submit_clicked
+
+
 def _submit_items(
     key_prefix, items_key, status_key, items,
     selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
@@ -661,6 +741,20 @@ def _submit_items(
 
         st.session_state[f"{key_prefix}_confirm_results"] = results
         st.session_state[items_key] = []
+        grn_submitted_clean = label == "GRN" and results and all(r["success"] for r in results)
+        if grn_submitted_clean:
+            try:
+                with timing.timed("fetch_grn_for_copy_text"):
+                    st.session_state[f"{key_prefix}_grn_copy_text"] = _grn_whatsapp_text(selected_shop_id)
+            except Exception as e:
+                # Best-effort: the GRN itself already submitted successfully
+                # above, so a failure here (e.g. a slow/flaky GET /grn)
+                # shouldn't look like the submission failed — just skip the
+                # copy button for this one.
+                timing.log("fetch_grn_for_copy_text_failed", error=str(e))
+                st.session_state[f"{key_prefix}_grn_copy_text"] = None
+        else:
+            st.session_state[f"{key_prefix}_grn_copy_text"] = None
         if results and all(r["success"] for r in results):
             # Everything went through clean — clear the paste box so the
             # next delivery starts from empty instead of staff having to
@@ -1009,9 +1103,7 @@ def _render_grn_skip_review(
         st.session_state[items_key] = edited_items
 
         unmatched_count = sum(1 for e in edited_items if not e.get("matched_product_id"))
-        if st.button(
-            "Submit GRN", key=f"{key_prefix}_submit_btn", disabled=bool(unmatched_count),
-        ):
+        if _render_submit_whatsapp_row(key_prefix, submit_disabled=bool(unmatched_count)):
             loading_ui.start_busy(submit_busy_key, items=edited_items)
             st.rerun()
         return
@@ -1044,9 +1136,8 @@ def _render_grn_skip_review(
         st.rerun()
         return
 
-    paste_text, submit_clicked = _render_paste_box(
-        key_prefix, "Submit GRN", f"{key_prefix}_submit_btn",
-    )
+    paste_text = _render_paste_textarea(key_prefix)
+    submit_clicked = _render_submit_whatsapp_row(key_prefix)
     if submit_clicked and paste_text:
         loading_ui.start_busy(submit_busy_key, paste_text=paste_text)
         st.rerun()
@@ -1207,6 +1298,7 @@ def render_parse_tab(
                 existing_items = st.session_state.get(items_key) or []
                 st.session_state[items_key] = existing_items + new_items
                 st.session_state[f"{key_prefix}_confirm_results"] = None
+                st.session_state[f"{key_prefix}_grn_copy_text"] = None
                 st.session_state[status_key] = f"Added {len(new_items)} item(s) — review below."
             loading_ui.clear_busy(read_busy_key, "paste_text", "adjust_mode")
             st.rerun()

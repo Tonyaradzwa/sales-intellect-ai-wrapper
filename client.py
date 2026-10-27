@@ -98,6 +98,47 @@ class SalesIntellectClient:
     def create_grn(self, data):
         return self._request("POST", "/grn", json=data)
 
+    def get_grn(self, grn_numbers=None, shop_ids=None, grn_status=None,
+                created_at_min=None, created_at_max=None):
+        """Fetch Good Receive Notes, optionally filtered by number/shop/status,
+        paging like list_products(). Same body-not-query-params quirk as the
+        other listing endpoints is assumed here too.
+        """
+        with timing.section("FETCHING GRNs (get_grn)", grn_numbers=grn_numbers, shop_ids=shop_ids):
+            grns = []
+            cursor = None
+            page_num = 0
+            while True:
+                page_num += 1
+                body = {"limit": PAGE_LIMIT}
+                if grn_numbers:
+                    body["grn_numbers"] = (
+                        ",".join(grn_numbers) if isinstance(grn_numbers, (list, tuple, set))
+                        else grn_numbers
+                    )
+                if shop_ids:
+                    body["shop_ids"] = (
+                        ",".join(shop_ids) if isinstance(shop_ids, (list, tuple, set))
+                        else shop_ids
+                    )
+                if grn_status:
+                    body["grn_status"] = grn_status
+                if created_at_min:
+                    body["created_at_min"] = created_at_min
+                if created_at_max:
+                    body["created_at_max"] = created_at_max
+                if cursor is not None:
+                    body["cursor"] = cursor
+                page = self._request("GET", "/grn", json=body)
+                page_grns = page.get("grn_list", [])
+                timing.log(f"page {page_num}", returned=len(page_grns))
+                if not page_grns:
+                    break
+                grns.extend(page_grns)
+                cursor = page.get("cursor")
+            timing.log("get_grn complete", pages=page_num, total_grns=len(grns))
+        return grns
+
     def get_inventory(self, shop_id, product_ids=None):
         """Fetch inventory levels for a shop, optionally narrowed to specific
         products, paging like list_products().

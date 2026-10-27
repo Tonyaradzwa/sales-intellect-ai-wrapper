@@ -59,6 +59,7 @@ def confirm_payloads(monkeypatch):
 
     monkeypatch.setattr(client_module.SalesIntellectClient, "list_shops", lambda self: SHOPS)
     monkeypatch.setattr(client_module.SalesIntellectClient, "list_suppliers", lambda self: SUPPLIERS_WITH_NA)
+    monkeypatch.setattr(client_module.SalesIntellectClient, "get_grn", lambda self, **kwargs: [])
 
     captured = []
 

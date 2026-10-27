@@ -72,6 +72,7 @@ def grn_skip_review(monkeypatch):
 
     monkeypatch.setattr(client_module.SalesIntellectClient, "list_shops", lambda self: SHOPS)
     monkeypatch.setattr(client_module.SalesIntellectClient, "list_suppliers", lambda self: SUPPLIERS)
+    monkeypatch.setattr(client_module.SalesIntellectClient, "get_grn", lambda self, **kwargs: [])
 
     state = {"parse_items": [], "confirmed": []}
 
@@ -105,6 +106,51 @@ def grn_skip_review(monkeypatch):
 def _start(at):
     at.selectbox(key="grn_shop").select("Branch A").run()
     at.selectbox(key="grn_supplier").select("Supplier One").run()
+
+
+def test_whatsapp_button_enables_only_after_a_successful_submit(grn_skip_review, monkeypatch):
+    """The "Open in WhatsApp" button next to "Submit GRN" starts disabled.
+    After a clean submit, the page looks the just-created GRN back up via
+    GET /grn (POST /grn doesn't return enough to identify it) and the
+    button enables with a wa.me link carrying that GRN as plain
+    product/qty text — no longer shown on screen, but still built, since
+    it's needed later."""
+    from streamlit.testing.v1 import AppTest
+    import urllib.parse
+
+    grn_skip_review["parse_items"] = PARSE_CLEAN
+    monkeypatch.setattr(
+        client_module.SalesIntellectClient, "get_grn",
+        lambda self, **kwargs: [{
+            "grn_number": "GRN-10042",
+            "items": [{"product_name": "Item A1", "grn_qty": 8}],
+        }],
+    )
+
+    at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
+    _start(at)
+
+    def wa_button():
+        matches = [b for b in at.get("link_button") if b.proto.label == "Open in WhatsApp"]
+        assert len(matches) == 1
+        return matches[0]
+
+    assert wa_button().proto.disabled
+
+    at.text_area(key="grn_paste_input").set_value("anything")
+    at.button(key="grn_submit_btn").click().run()
+    assert not at.exception, at.exception
+
+    expected = "Branch A\nGRN-10042\n\nItem A1    8"
+    assert at.session_state["grn_grn_copy_text"] == expected
+    assert not at.code  # no longer shown on screen
+
+    button = wa_button()
+    assert not button.proto.disabled
+    assert button.proto.url == "https://wa.me/?text=" + urllib.parse.quote(expected, safe="")
 
 
 def test_clean_parse_submits_immediately_with_no_read_or_confirm_buttons(grn_skip_review):
