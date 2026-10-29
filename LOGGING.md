@@ -1,7 +1,7 @@
 # Reading the logs
 
 How to find out what happened during a GRN submit: what the user did, what the
-page showed, and what the server and the ERP did. Written after the 28 Oct GRN
+page showed, and what the server and the Sales Intellect API did. Written after the 28 Oct GRN
 incident, when we could not tell whether the user clicked Submit, whether the
 page reloaded, or which lines went into which GRN.
 
@@ -27,7 +27,7 @@ Every `events.log` line carries these where they are known.
 
 - **`browser_id`** (`b-…`): stored in a cookie (`si_browser_id`), so it survives reloads and new tabs. Same `browser_id` with a new `session_id` means the same browser reloaded, reconnected or opened a second tab. A different `browser_id` is another person or device.
 - **`session_id`** (`s-…`): one per Streamlit session. A reload, websocket reconnect (network drop, laptop sleep), new tab or server restart all mint a new one.
-- **`attempt_id`** (`att-…`): one per paste-to-GRN attempt. It starts when the pasted text is committed, and it also goes to Flask as the `X-Request-ID` header, so server events, ERP calls and the gunicorn access log (`attempt=…`) carry it too. A new attempt starts when the pasted text changes or after the previous attempt ended with a clean submit.
+- **`attempt_id`** (`att-…`): one per paste-to-GRN attempt. It starts when the pasted text is committed, and it also goes to Flask as the `X-Request-ID` header, so server events, Sales Intellect API calls and the gunicorn access log (`attempt=…`) carry it too. A new attempt starts when the pasted text changes or after the previous attempt ended with a clean submit.
 
 The text box only commits on blur or Ctrl+Enter, so an attempt starts then, not on the first keystroke.
 
@@ -40,8 +40,8 @@ One JSON object per line.
 ```
 
 - `ts`: UTC. `level` is only present for `WARN` and `ERROR`.
-- `layer`: `ui` is what the Streamlit page rendered or the user did. `api` is what server/ERP code decided or returned. One event name is never used by both layers, except `duplicate_submission`, which is logged once by each so you can see both what the server decided and that the page asked.
-- `erp_call` events are `layer: api` even when the call was made from the Streamlit process (the page's own `GET /shops` and `GET /grn`). They still carry the attempt, so they join up.
+- `layer`: `ui` is what the Streamlit page rendered or the user did. `api` is what server/API code decided or returned. One event name is never used by both layers, except `duplicate_submission`, which is logged once by each so you can see both what the server decided and that the page asked.
+- `si_call` events are `layer: api` even when the call was made from the Streamlit process (the page's own `GET /shops` and `GET /grn`). They still carry the attempt, so they join up.
 
 ## Event reference
 
@@ -66,14 +66,14 @@ One JSON object per line.
 | `grn_number_found` | `grn_number`, `lines_sent`, `lines_found` | The GRN number, learned from the page's own lookup for the WhatsApp text. `WARN` if the line counts differ |
 | `backend_call_failed` | `path`, `status`, `body_head` or `error` | A call from Streamlit to Flask failed (`ERROR`) |
 
-### Server and ERP (api)
+### Server and Sales Intellect API (api)
 
 | Event | Fields | Meaning |
 | --- | --- | --- |
 | `server_start` | `version` (git SHA), `pid` | A Flask worker started. Several in a row at the same moment means a restart |
-| `erp_call` | `method`, `path`, `status`, `dur_ms`, `resp_bytes`, `erp_request_id` | Every call to the ERP. No body is logged on success |
-| `erp_call_failed` | same, plus `body_head` (first 300 chars) or `error` | A non-2xx or a connection error (`ERROR`). The token is never logged |
-| `grn_created` | `shop`, `shop_id`, `grn_date`, `lines_sent`, `erp_ack`, `elapsed_ms` | `POST /grn` succeeded. The ERP does not return the GRN number, so it is not here; see `grn_number_found` |
+| `si_call` | `method`, `path`, `status`, `dur_ms`, `resp_bytes`, `si_request_id` | Every call to the Sales Intellect API. No body is logged on success |
+| `si_call_failed` | same, plus `body_head` (first 300 chars) or `error` | A non-2xx or a connection error (`ERROR`). The token is never logged |
+| `grn_created` | `shop`, `shop_id`, `grn_date`, `lines_sent`, `si_ack`, `elapsed_ms` | `POST /grn` succeeded. The Sales Intellect API does not return the GRN number, so it is not here; see `grn_number_found` |
 | `grn_refused` | `lines_sent`, `lines_complete`, `lines_incomplete`, `incomplete[]` (`text`, `matched_product_id`, `server_reason`) | The server refused the whole GRN because lines had no quantity (`quantity_missing`) or no product (`not_found`). Nothing was created |
 | `grn_failed` | `lines_sent`, `error` | `POST /grn` raised (`ERROR`) |
 | `duplicate_submission` | `matches_attempt_id`, `age_s`, `lines`, `action` | The payload is identical to the shop's previous GRN, within 15 minutes. `action` is `asked_user` (a 409 went back) or `submitted_anyway` (the user confirmed) |
@@ -119,13 +119,13 @@ On the box, `journalctl ... > file` is how to pull a window to download.
 
 ## Reading one attempt
 
-A clean submit, in order (times vary, and `erp_call` lines are interleaved):
+A clean submit, in order (times vary, and `si_call` lines are interleaved):
 
 1. `attempt_started`
 2. `submit_clicked` (`source: button_click`), then `busy_set`
 3. `submit_resumed` (`source: busy_resume`): the page reruns with the flag set
-4. `erp_call GET /shops`, `erp_call POST /grn`, `grn_created` (server)
-5. `erp_call GET /grn` (the page's lookup, 250 GRNs per page, the slowest step), then `grn_number_found`
+4. `si_call GET /shops`, `si_call POST /grn`, `grn_created` (server)
+5. `si_call GET /grn` (the page's lookup, 250 GRNs per page, the slowest step), then `grn_number_found`
 6. `attempt_ended`, `busy_cleared`
 
 A refused GRN: `submit_clicked`, `busy_set`, `submit_resumed`, `grn_refused` (api), `refusal_shown` (ui), `busy_cleared`. There is no `grn_created` and no `POST /grn`.
@@ -147,8 +147,8 @@ A repeat submit: `duplicate_submission` (api, then ui), and nothing is created. 
 
 - **`submit_clicked` with no `grn_*` event after it.** When the page itself flags lines (no match, or no quantity), it stops before sending anything, and that is not logged yet. See the TODO list. The `/parse` lines in `timings.log` for the same attempt will show the item counts.
 - **`submit_resumed` right after every `submit_clicked`.** Normal. The click sets the busy flag and reruns; the rerun does the work.
-- **`erp_call GET /grn` taking several seconds.** Expected on shops with many GRNs; it is the page's WhatsApp lookup.
-- **Two `erp_call GET /grn` lines.** The client pages until it gets an empty page, so the second one returns nothing.
+- **`si_call GET /grn` taking several seconds.** Expected on shops with many GRNs; it is the page's WhatsApp lookup.
+- **Two `si_call GET /grn` lines.** The client pages until it gets an empty page, so the second one returns nothing.
 - **`timings.log` times differ from `events.log`.** `timings.log` uses server local time and `events.log` uses UTC.
 
 ## Files this adds
@@ -176,8 +176,8 @@ Work still to do, roughly in the order it should happen.
 - [ ] **Ship the logs somewhere searchable.** CloudWatch Logs is the suggestion (the app runs on EC2): agent install, an IAM role, a log group with 90-day retention, and a check that the JSON fields show up in Logs Insights. If the `grn_*` events need longer retention, use a second log group filtered on those names.
 - [ ] **Make the older logs line up.** Give `timings.log` and `actions.log` a date and UTC, and add `attempt_id` to `actions.log` (it is already in `timings.log`). Raise the Streamlit app logger to INFO, and log the app version once at Streamlit startup (only Flask logs it today).
 - [ ] **Tune the duplicate window.** 15 minutes (`GRN_DUPLICATE_WINDOW_S` in `server.py`) is a starting value. Look at how often `duplicate_submission` fires and how often the answer is `submit_anyway`.
-- [ ] **Write `attempt_id` into the GRN's notes field**, if the ERP has one (for example `via wrapper att-5e09`), so a GRN in the ERP can be traced to its logs and back.
-- [ ] **Look for an ERP request ID.** `erp_call` logs `erp_request_id` from `X-Request-ID` or `X-Amzn-Trace-Id` if the ERP sends one. None showed up in the preprod runs, so it probably sends neither; confirm with the vendor.
+- [ ] **Write `attempt_id` into the GRN's notes field**, if the Sales Intellect API has one (for example `via wrapper att-5e09`), so a GRN in Sales Intellect can be traced to its logs and back.
+- [ ] **Look for a Sales Intellect request ID.** `si_call` logs `si_request_id` from `X-Request-ID` or `X-Amzn-Trace-Id` if the Sales Intellect API sends one. None showed up in the preprod runs, so it probably sends neither; confirm with the vendor.
 
 ### Then
 
@@ -188,7 +188,7 @@ Work still to do, roughly in the order it should happen.
   - `submit_resumed` with a `note`.
   - Any `busy_stale`.
   - Any `flag_mismatch`, once it exists.
-  - Any non-2xx on `POST /grn` (`erp_call_failed`).
+  - Any non-2xx on `POST /grn` (`si_call_failed`).
 - [ ] **Incident tooling (plan change 9).**
   - `tools/incident_timeline.py` to merge the four sources for a shop and window, grouped by session.
   - A replay tool that runs a logged paste against preprod (needs the raw text kept behind a flag for 30 days; today only its hash is logged).
@@ -197,5 +197,5 @@ Work still to do, roughly in the order it should happen.
 
 ### Maybe
 
-- [ ] **Speed up the page's GRN lookup.** The WhatsApp lookup downloads the shop's first 250 GRNs (about 260 KB and around 7 s on preprod including the empty second page). Ideas: ask for a specific `grn_numbers` value, or check whether the ERP returns newest first so a page size of 1 would do. Neither has been tested.
+- [ ] **Speed up the page's GRN lookup.** The WhatsApp lookup downloads the shop's first 250 GRNs (about 260 KB and around 7 s on preprod including the empty second page). Ideas: ask for a specific `grn_numbers` value, or check whether the Sales Intellect API returns newest first so a page size of 1 would do. Neither has been tested.
 - [ ] **Pick up the unrelated files.** `grn_email.py`, `grn_pdf.py`, `send_grn_email.py` and the `reportlab` line in `requirements.txt` were already uncommitted before this work and were left out of its commit.
