@@ -16,6 +16,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 
+import events
+
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timings.log")
 _write_lock = threading.Lock()
 _depth = threading.local()
@@ -49,6 +51,9 @@ def log(label, dur=None, **fields):
     parts = []
     if dur is not None:
         parts.append(f"dur={dur:.3f}s")
+    attempt_id = events.current("attempt_id")
+    if attempt_id and "attempt_id" not in fields:
+        fields = {**fields, "attempt_id": attempt_id}
     meta = _fmt_fields(fields)
     if meta:
         parts.append(meta)
@@ -58,10 +63,12 @@ def log(label, dur=None, **fields):
 
 @contextmanager
 def timed(label, **fields):
-    """Wraps a block, logging one line with its duration when it exits."""
+    """Wraps a block, logging one line with its duration when it exits.
+    Yields the fields dict, so the block can add to it (e.g. the HTTP
+    status, only known once the call returns) before the line is written."""
     t0 = time.perf_counter()
     try:
-        yield
+        yield fields
     finally:
         dur = time.perf_counter() - t0
         log(label, dur=dur, **fields)

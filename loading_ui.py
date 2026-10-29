@@ -18,9 +18,12 @@ light/dark toggle (in its settings menu) against their OS preference, in
 which case this overlay's colors may not match the rest of the page.
 """
 
+import time
 from contextlib import contextmanager
 
 import streamlit as st
+
+import ui_events
 
 # Above _render_production_banner's fixed banner (z-index: 1000000, app.py),
 # so the overlay still shows on top of it in a production deployment.
@@ -208,15 +211,26 @@ def start_busy(key, **payload):
     next run to read back via busy_payload(). Caller must st.rerun() right
     after calling this."""
     st.session_state[f"_busy__{key}"] = True
+    st.session_state[f"_busy_since__{key}"] = time.time()
     for k, v in payload.items():
         st.session_state[f"_busy_payload__{key}__{k}"] = v
+    ui_events.log("busy_set", key=key)
 
 
 def busy_payload(key, payload_key):
     return st.session_state.get(f"_busy_payload__{key}__{payload_key}")
 
 
+def busy_age_s(key):
+    """Seconds since start_busy(key), or None if it isn't set."""
+    since = st.session_state.get(f"_busy_since__{key}")
+    return None if since is None else time.time() - since
+
+
 def clear_busy(key, *payload_keys):
+    since = st.session_state.pop(f"_busy_since__{key}", None)
+    if since is not None:
+        ui_events.log("busy_cleared", key=key, held_ms=ui_events.monotonic_ms(since))
     st.session_state[f"_busy__{key}"] = False
     for k in payload_keys:
         st.session_state.pop(f"_busy_payload__{key}__{k}", None)

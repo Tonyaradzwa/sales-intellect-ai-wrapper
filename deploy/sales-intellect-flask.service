@@ -11,6 +11,7 @@ ExecStart=/bin/bash -c 'exec /home/ec2-user/app/.venv/bin/gunicorn \
   --bind ${FLASK_HOST:-127.0.0.1}:${FLASK_PORT:-5050} \
   --workers ${FLASK_WORKERS:-2} \
   --timeout ${FLASK_TIMEOUT:-900} \
+  --config /home/ec2-user/app/deploy/gunicorn.conf.py \
   server:app'
 Restart=always
 RestartSec=5

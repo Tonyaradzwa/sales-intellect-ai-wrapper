@@ -97,7 +97,7 @@ def confirm_payloads(monkeypatch):
 
     captured = []
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, headers=None):
         if url.endswith("/parse"):
             return FakeResponse(200, {"items": PARSE_RESPONSES[json["text"]]})
         if url.endswith("/confirm"):
@@ -109,7 +109,7 @@ def confirm_payloads(monkeypatch):
             return FakeResponse(200, {"results": results})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, headers=None):
         if url.endswith("/catalog"):
             return FakeResponse(200, {
                 "products": CATALOG_PRODUCTS,
@@ -180,7 +180,7 @@ def test_failed_confirm_keeps_items(confirm_payloads, monkeypatch):
     """A failed /confirm must not lose the staff member's pasted work."""
     import requests
 
-    def failing_post(url, json=None, timeout=None):
+    def failing_post(url, json=None, timeout=None, headers=None):
         if url.endswith("/parse"):
             return FakeResponse(200, {"items": PARSE_RESPONSES[json["text"]]})
         if url.endswith("/confirm"):

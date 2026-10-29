@@ -14,8 +14,10 @@ from datetime import date, datetime
 import requests
 import streamlit as st
 
+import events
 import loading_ui
 import timing
+import ui_events
 from client import SalesIntellectClient
 
 BACKEND_URL = os.environ.get("SI_BACKEND_URL", "http://127.0.0.1:5050")
@@ -212,6 +214,19 @@ _MATCH_STATUS_STYLE = {
 }
 
 
+def _grn_flag_reason(item):
+    """Why a goods_received line can't be submitted yet: "not_found" (no
+    matched product) or "quantity_missing" (matched, but the delivery note
+    gave no quantity). None if it's ready. The server refuses the whole GRN
+    for either (see server._grn_incomplete_reason), so the page must stop
+    first and show it."""
+    if not item.get("matched_product_id"):
+        return "not_found"
+    if item.get("quantity") is None:
+        return "quantity_missing"
+    return None
+
+
 def _render_match_rows(
     items, key_prefix, action, qty_label, product_lookup, compact=False,
     hide_statuses=frozenset(), hidden_caption=None,
@@ -286,7 +301,9 @@ def _render_match_rows(
         backend_exact = bool(item.get("exact_match")) and matched_id is not None
         backend_status = "exact" if backend_exact else ("unmatched" if matched_id is None else "fuzzy")
 
-        if compact and backend_status in hide_statuses:
+        missing_qty = action == "goods_received" and item.get("quantity") is None
+
+        if compact and backend_status in hide_statuses and not missing_qty:
             # Trusted as-is — still included in the submitted payload, just
             # not rendered, so there's nothing to review.
             hidden_count += 1
@@ -344,13 +361,21 @@ def _render_match_rows(
 
         qty_col = cols[1] if compact else cols[2]
         qty = qty_col.number_input(
-            qty_label, value=int(item.get("quantity") or 0),
+            qty_label, value=None if missing_qty else int(item.get("quantity") or 0),
             step=1, key=f"{key_prefix}_qty_{rid}", label_visibility="collapsed",
+            **({"placeholder": qty_label} if missing_qty else {}),
         )
+        qty_still_missing = missing_qty and qty is None
+        if compact and qty_still_missing:
+            name_cell.caption("⚠️ No quantity")
+            if status != "unmatched":
+                row_styles.append((name_cell_key, "unmatched"))
 
         if not compact:
             if chosen_id is None:
                 cols[3].caption(unmatched_caption)
+            elif qty_still_missing:
+                cols[3].caption("⚠️ No quantity")
             elif is_exact:
                 cols[3].caption("✓ Exact match")
 
@@ -553,7 +578,21 @@ def _render_inventory_rows(items, key_prefix, product_lookup, shop_id):
     return edited_items, deleted_rid
 
 
-def _grn_whatsapp_text(shop_id):
+def _latest_grn(shop_id):
+    """The newest GRN for the shop via GET /grn, or None. See
+    _grn_whatsapp_text for why this has to be a lookup after the fact."""
+    grns = get_client().get_grn(shop_ids=shop_id)
+    if not grns:
+        return None
+
+    def _grn_num(g):
+        digits = "".join(ch for ch in g.get("grn_number", "") if ch.isdigit())
+        return int(digits) if digits else -1
+
+    return max(grns, key=_grn_num)
+
+
+def _grn_whatsapp_text(shop_id, grn=None):
     """Looks up the GRN just submitted via GET /grn and formats it as plain
     text simple enough to read clearly in a WhatsApp message: shop name and
     GRN number up top, then each product with its quantity, nothing else.
@@ -567,15 +606,9 @@ def _grn_whatsapp_text(shop_id):
     sequentially, and we just created the newest one for this shop.
     """
     client = get_client()
-    grns = client.get_grn(shop_ids=shop_id)
-    if not grns:
+    grn = grn or _latest_grn(shop_id)
+    if not grn:
         return None
-
-    def _grn_num(g):
-        digits = "".join(ch for ch in g.get("grn_number", "") if ch.isdigit())
-        return int(digits) if digits else -1
-
-    grn = max(grns, key=_grn_num)
 
     # GET /grn gives shop_id, not shop_name — reuses the same cached shop
     # list the Shop dropdown already fetched, instead of a fresh API call.
@@ -629,7 +662,7 @@ def _render_submit_whatsapp_row(key_prefix, submit_disabled=False):
 def _submit_items(
     key_prefix, items_key, status_key, items,
     selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
-    label="item", grn_date=None,
+    label="item", grn_date=None, allow_duplicate=False,
 ):
     """POSTs /confirm for a batch of (already-flag-free) items and updates
     status_key/confirm_results accordingly. Shared by every Confirm/Submit
@@ -665,19 +698,24 @@ def _submit_items(
     }
     if grn_date is not None:
         confirm_body["grn_date"] = grn_date.isoformat()
+    if allow_duplicate:
+        confirm_body["confirm_duplicate"] = True
     run_id = timing.new_run_id()
     with timing.section(
         "FRONTEND: CONFIRM AND SUBMIT", run_id=run_id, items=len(payload_items),
     ):
         try:
             with loading_ui.overlay(f"Saving {len(payload_items)} item(s) to Sales Intellect…"):
-                with timing.timed("http_post_confirm"):
+                with timing.timed("http_post_confirm") as t:
                     resp = requests.post(
                         f"{BACKEND_URL}/confirm",
                         json=confirm_body,
+                        headers=ui_events.request_headers(),
                         timeout=30,
                     )
+                    t["status"] = resp.status_code
         except Exception as e:
+            ui_events.log("backend_call_failed", level="ERROR", path="/confirm", error=str(e))
             st.session_state[status_key] = (
                 f"Could not reach confirm backend at {BACKEND_URL}: {e}. "
                 "Check your connection and try again."
@@ -687,7 +725,39 @@ def _submit_items(
 
         if not resp.ok:
             error = resp.json().get("error", resp.text)
-            st.session_state[status_key] = f"Submit failed: {error}. Check the items and try again."
+            if resp.status_code == 409 and resp.json().get("duplicate"):
+                # Identical to this shop's previous GRN (see server._submit_grn)
+                # — nothing was sent to the ERP. Park the batch and ask; the
+                # prompt (_render_duplicate_prompt) resubmits with
+                # confirm_duplicate if the user says it's intentional.
+                previous = resp.json().get("previous") or {}
+                st.session_state[f"{key_prefix}_duplicate_pending"] = {
+                    "items": items, "message": error, "shop_id": selected_shop_id,
+                    "supplier_id": selected_supplier_id, "grn_date": grn_date,
+                    # The paste box isn't drawn while the prompt is up, and
+                    # Streamlit drops the state of undrawn widgets — keep the
+                    # text so Cancel can put it back.
+                    "paste_text": st.session_state.get(f"{key_prefix}_paste_input", ""),
+                }
+                st.session_state[status_key] = None
+                ui_events.log(
+                    "duplicate_submission", level="WARN", age_s=previous.get("age_s"),
+                    matches_attempt_id=previous.get("attempt_id"), lines=len(payload_items),
+                    action="asked_user",
+                )
+                timing.log("confirm_duplicate", lines=len(payload_items))
+                return
+            if resp.status_code == 422:
+                # The server refused the whole GRN (see server._submit_grn) —
+                # its message already names the lines and says nothing was saved.
+                st.session_state[status_key] = error
+                ui_events.log("refusal_shown", message_shown=error)
+            else:
+                st.session_state[status_key] = f"Submit failed: {error}. Check the items and try again."
+                ui_events.log(
+                    "backend_call_failed", level="ERROR", path="/confirm",
+                    status=resp.status_code, body_head=events.body_head(resp.text),
+                )
             timing.log("confirm_failed", error=error)
             return
 
@@ -706,7 +776,10 @@ def _submit_items(
             job = None
             while time.time() < deadline:
                 try:
-                    poll_resp = requests.get(f"{BACKEND_URL}/job/status/{job_id}", timeout=10)
+                    poll_resp = requests.get(
+                    f"{BACKEND_URL}/job/status/{job_id}", timeout=10,
+                    headers=ui_events.request_headers(),
+                )
                     poll_resp.raise_for_status()
                     job = poll_resp.json()
                 except Exception as e:
@@ -742,10 +815,23 @@ def _submit_items(
         st.session_state[f"{key_prefix}_confirm_results"] = results
         st.session_state[items_key] = []
         grn_submitted_clean = label == "GRN" and results and all(r["success"] for r in results)
+        grn_number = None
         if grn_submitted_clean:
             try:
                 with timing.timed("fetch_grn_for_copy_text"):
-                    st.session_state[f"{key_prefix}_grn_copy_text"] = _grn_whatsapp_text(selected_shop_id)
+                    grn = _latest_grn(selected_shop_id)
+                    st.session_state[f"{key_prefix}_grn_copy_text"] = _grn_whatsapp_text(selected_shop_id, grn)
+                if grn:
+                    # The ERP's create call never says which GRN it made; this
+                    # lookup (already needed for the WhatsApp text) is the one
+                    # place the number is learned, so it's logged here.
+                    grn_number = grn.get("grn_number")
+                    lines_found = len(grn.get("items", []))
+                    ui_events.log(
+                        "grn_number_found", grn_number=grn_number, lines_sent=len(payload_items),
+                        lines_found=lines_found,
+                        level=None if lines_found == len(payload_items) else "WARN",
+                    )
             except Exception as e:
                 # Best-effort: the GRN itself already submitted successfully
                 # above, so a failure here (e.g. a slow/flaky GET /grn)
@@ -782,7 +868,44 @@ def _submit_items(
         # just left alone) so a stale prior message — e.g. "N item(s) are
         # flagged" from before this submission — doesn't linger on screen.
         st.session_state[status_key] = None
-        st.toast(f"Submitted {label} with {len(payload_items)} item(s).")
+        if grn_number and grn_submitted_clean:
+            st.toast(f"Saved {grn_number} with {len(results)} line(s).")
+        else:
+            st.toast(f"Submitted {label} with {len(payload_items)} item(s).")
+        if results and all(r["success"] for r in results):
+            ui_events.end_attempt("submitted")
+
+
+def _render_duplicate_prompt(key_prefix, items_key, status_key):
+    """If the server flagged the last submit as identical to the shop's
+    previous GRN, shows the warning with "Submit anyway" / "Cancel" instead
+    of the normal flow. Returns True while it's showing."""
+    pending_key = f"{key_prefix}_duplicate_pending"
+    pending = st.session_state.get(pending_key)
+    if not pending:
+        return False
+    with st.container(border=True):
+        st.warning(pending["message"])
+        again_col, cancel_col = st.columns(2)
+        again = again_col.button(
+            "Submit anyway", key=f"{key_prefix}_dup_again_btn", use_container_width=True,
+        )
+        cancel = cancel_col.button("Cancel", key=f"{key_prefix}_dup_cancel_btn", use_container_width=True)
+    if again:
+        del st.session_state[pending_key]
+        ui_events.log("duplicate_decision", decision="submit_anyway")
+        _submit_items(
+            key_prefix, items_key, status_key, pending["items"],
+            pending["shop_id"], pending["supplier_id"], False, False,
+            label="GRN", grn_date=pending["grn_date"], allow_duplicate=True,
+        )
+        st.rerun()
+    elif cancel:
+        del st.session_state[pending_key]
+        st.session_state[f"{key_prefix}_paste_input"] = pending.get("paste_text", "")
+        ui_events.log("duplicate_decision", decision="cancelled")
+        st.rerun()
+    return True
 
 
 def _render_paste_textarea(key_prefix):
@@ -936,23 +1059,30 @@ def _run_parse_flow(mode, text):
         text_lines=len(text.splitlines()),
     ):
         try:
-            with timing.timed("http_post_parse"):
+            with timing.timed("http_post_parse") as t:
                 resp = requests.post(
                     f"{BACKEND_URL}/parse",
                     json={"text": text, "mode": mode},
+                    headers=ui_events.request_headers(),
                     # The heavy work now runs server-side in a background
                     # thread (see server.py) — this call just kicks it off
                     # (or, for a fully-resolved paste, returns the result
                     # directly), so it should return quickly either way.
                     timeout=30,
                 )
+                t["status"] = resp.status_code
         except Exception as e:
             timing.log("parse_exception", error=str(e))
+            ui_events.log("backend_call_failed", level="ERROR", path="/parse", error=str(e))
             return None, f"Could not reach backend at {BACKEND_URL}: {e}"
 
         if not resp.ok:
             error = resp.json().get("error", resp.text)
             timing.log("parse_failed", error=error)
+            ui_events.log(
+                "backend_call_failed", level="ERROR", path="/parse",
+                status=resp.status_code, body_head=events.body_head(resp.text),
+            )
             return None, f"Couldn't process that: {error}"
 
         data = resp.json()
@@ -994,7 +1124,10 @@ def _run_parse_flow(mode, text):
         job = None
         while time.time() < deadline:
             try:
-                poll_resp = requests.get(f"{BACKEND_URL}/job/status/{job_id}", timeout=10)
+                poll_resp = requests.get(
+                    f"{BACKEND_URL}/job/status/{job_id}", timeout=10,
+                    headers=ui_events.request_headers(),
+                )
                 poll_resp.raise_for_status()
                 job = poll_resp.json()
             except Exception as e:
@@ -1083,6 +1216,10 @@ def _render_grn_skip_review(
             # Replaces the correction table entirely while submitting —
             # nothing clickable on screen, and no risk of re-deriving a
             # different edited_items from the same widget keys mid-submit.
+            ui_events.log_submit_resumed(
+                busy_age_s=loading_ui.busy_age_s(submit_busy_key),
+                prior_attempt_id=loading_ui.busy_payload(submit_busy_key, "attempt_id"),
+            )
             _submit_items(
                 key_prefix, items_key, status_key, loading_ui.busy_payload(submit_busy_key, "items"),
                 selected_shop_id, selected_supplier_id, show_shop_selector, show_supplier_selector,
@@ -1102,21 +1239,31 @@ def _render_grn_skip_review(
             st.rerun()
         st.session_state[items_key] = edited_items
 
-        unmatched_count = sum(1 for e in edited_items if not e.get("matched_product_id"))
+        unmatched_count = sum(1 for e in edited_items if _grn_flag_reason(e))
         if _render_submit_whatsapp_row(key_prefix, submit_disabled=bool(unmatched_count)):
-            loading_ui.start_busy(submit_busy_key, items=edited_items)
+            ui_events.log_submit_clicked(
+                mode=mode, shop_id=selected_shop_id, grn_date=selected_grn_date.isoformat() if selected_grn_date else None,
+                lines=len(edited_items), skip_review=True, view="correction",
+            )
+            loading_ui.start_busy(
+                submit_busy_key, items=edited_items, attempt_id=ui_events.current_attempt_id(),
+            )
             st.rerun()
         return
 
     if submit_busy:
         # Replaces the paste box + button entirely while parsing/submitting.
         text = loading_ui.busy_payload(submit_busy_key, "paste_text")
+        ui_events.log_submit_resumed(
+            busy_age_s=loading_ui.busy_age_s(submit_busy_key),
+            prior_attempt_id=loading_ui.busy_payload(submit_busy_key, "attempt_id"),
+        )
         new_items, error = _run_parse_flow(mode, text)
         if error is not None:
             st.session_state[status_key] = f"Couldn't process that: {error}"
         else:
             new_items = _with_row_ids(new_items)
-            unmatched_count = sum(1 for it in new_items if not it.get("matched_product_id"))
+            unmatched_count = sum(1 for it in new_items if _grn_flag_reason(it))
             if unmatched_count:
                 st.session_state[items_key] = new_items
                 st.session_state[status_key] = (
@@ -1132,14 +1279,25 @@ def _render_grn_skip_review(
                     show_shop_selector, show_supplier_selector,
                     label="GRN", grn_date=selected_grn_date,
                 )
-        loading_ui.clear_busy(submit_busy_key, "paste_text")
+        loading_ui.clear_busy(submit_busy_key, "paste_text", "attempt_id")
         st.rerun()
         return
 
     paste_text = _render_paste_textarea(key_prefix)
+    if paste_text:
+        # The attempt starts at the paste, not the click, so a paste that's
+        # never submitted is still visible in the log.
+        ui_events.begin_attempt_for_text(paste_text)
     submit_clicked = _render_submit_whatsapp_row(key_prefix)
     if submit_clicked and paste_text:
-        loading_ui.start_busy(submit_busy_key, paste_text=paste_text)
+        ui_events.log_submit_clicked(
+            mode=mode, shop_id=selected_shop_id, grn_date=selected_grn_date.isoformat() if selected_grn_date else None,
+            text_sha=ui_events._text_sha(paste_text), text_chars=len(paste_text),
+            text_lines=len(paste_text.splitlines()), skip_review=True, view="paste",
+        )
+        loading_ui.start_busy(
+            submit_busy_key, paste_text=paste_text, attempt_id=ui_events.current_attempt_id(),
+        )
         st.rerun()
 
 
@@ -1161,6 +1319,8 @@ def render_parse_tab(
     catalog_products: the shared, already-fetched catalog (see
     render_catalog_bar()).
     """
+    ui_events.init_session()  # no-op after app.py's own call; covers pages run directly
+
     if subheader:
         st.subheader(subheader)
     if caption:
@@ -1264,7 +1424,9 @@ def render_parse_tab(
 
     skip_review = mode == "goods_received" and _env_flag("SI_GRN_SKIP_REVIEW", default="true")
 
-    if skip_review:
+    if _render_duplicate_prompt(key_prefix, items_key, status_key):
+        pass  # warning is up; the normal flow resumes once it's answered
+    elif skip_review:
         _render_grn_skip_review(
             key_prefix, mode, items_key, status_key, catalog_products,
             selected_shop_id, selected_supplier_id,
@@ -1424,7 +1586,10 @@ def render_parse_tab(
 
                 unmatched_count = sum(
                     1 for e in edited_items
-                    if e["action"] in ("stock_update", "goods_received") and not e.get("matched_product_id")
+                    if e["action"] in ("stock_update", "goods_received") and (
+                        not e.get("matched_product_id")
+                        or (e["action"] == "goods_received" and e.get("quantity") is None)
+                    )
                 )
                 if unmatched_count:
                     st.warning(

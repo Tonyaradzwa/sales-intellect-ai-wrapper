@@ -76,7 +76,7 @@ def grn_skip_review(monkeypatch):
 
     state = {"parse_items": [], "confirmed": []}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, headers=None):
         if url.endswith("/parse"):
             return FakeResponse(200, {"items": state["parse_items"]})
         if url.endswith("/confirm"):
@@ -88,7 +88,7 @@ def grn_skip_review(monkeypatch):
             return FakeResponse(200, {"results": results})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, headers=None):
         if url.endswith("/catalog"):
             return FakeResponse(200, {
                 "products": CATALOG_PRODUCTS, "fetched_at": "2026-01-01T00:00:00",

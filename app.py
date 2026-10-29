@@ -13,9 +13,11 @@ import streamlit as st
 
 import core
 import loading_ui
+import ui_events
 
 st.set_page_config(page_title="Sales Intellect POS", layout="wide")
 loading_ui.inject_global_css()
+ui_events.init_session()
 
 # Belt-and-suspenders against position="hidden" below: Streamlit's legacy
 # auto-generated page list (built from the pages/ directory, independent of

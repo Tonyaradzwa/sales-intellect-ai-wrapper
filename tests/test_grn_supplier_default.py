@@ -67,7 +67,7 @@ def confirm_payloads(monkeypatch):
 
     captured = []
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, headers=None):
         if url.endswith("/parse"):
             return FakeResponse(200, {"items": PARSE_CLEAN})
         if url.endswith("/confirm"):
@@ -77,7 +77,7 @@ def confirm_payloads(monkeypatch):
             return FakeResponse(200, {"results": results})
         raise AssertionError(url)
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, headers=None):
         if url.endswith("/catalog"):
             return FakeResponse(200, {"products": CATALOG_PRODUCTS, "fetched_at": "x", "count": 1})
         raise AssertionError(url)

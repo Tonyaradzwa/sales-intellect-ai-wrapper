@@ -33,6 +33,8 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, create_sdk_mcp_s
 from flask import Flask, jsonify, request
 
 import actions
+import events
+import grn_store
 import job_store
 import timing
 from client import SalesIntellectClient
@@ -46,6 +48,30 @@ DEPLOY_TRIGGER_SCRIPT = os.environ.get(
 )
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _bind_attempt_id():
+    # The Streamlit app sends its attempt_id as X-Request-ID; binding it here
+    # puts it on every events.log / timings.log line this request writes
+    # (client.py's ERP calls included). Background threads re-bind it themselves.
+    events.bind(attempt_id=request.headers.get("X-Request-ID"))
+
+
+@app.after_request
+def _echo_attempt_id(response):
+    attempt_id = events.current("attempt_id")
+    if attempt_id:
+        response.headers["X-Request-ID"] = attempt_id
+    return response
+
+
+@app.teardown_request
+def _unbind_attempt_id(exc):
+    events.clear()
+
+
+events.log_event("server_start", "api", version=events.app_version(), pid=os.getpid())
 
 try:
     si_client = SalesIntellectClient()
@@ -1172,7 +1198,10 @@ def parse():
         def progress_cb(n):
             job_store.update_job(job_id, done=n)
 
+        attempt_id = events.current("attempt_id")
+
         def _background():
+            events.bind(attempt_id=attempt_id)
             bg_run_id = timing.new_run_id()
             with timing.section("PARSE AGENT BACKGROUND", run_id=bg_run_id, job_id=job_id):
                 try:
@@ -1361,6 +1390,7 @@ def confirm():
     supplier_id = body.get("supplier_id")
     items = body.get("items")
     grn_date = body.get("grn_date")
+    confirm_duplicate = bool(body.get("confirm_duplicate"))
 
     if not isinstance(items, list) or not items:
         return jsonify({"error": "items must be a non-empty list."}), 400
@@ -1394,7 +1424,22 @@ def confirm():
             results = []
             if grn_items:
                 with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
-                    results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date))
+                    try:
+                        results.extend(_submit_grn(
+                            grn_items, shop_id, supplier_id, shop_name, grn_date, confirm_duplicate,
+                        ))
+                    except GrnRefused as refusal:
+                        return jsonify({
+                            "error": refusal.message,
+                            "refused": True,
+                            "incomplete": refusal.incomplete,
+                        }), 422
+                    except GrnDuplicate as dup:
+                        return jsonify({
+                            "error": dup.message,
+                            "duplicate": True,
+                            "previous": dup.previous,
+                        }), 409
             return jsonify({"results": results})
 
         # other_items has a real per-item server-side loop (each one is a
@@ -1406,7 +1451,10 @@ def confirm():
         job_store.create_job(job_id, total=total, kind="confirm", done=0)
         timing.log("confirm_job_created", job_id=job_id, total=total)
 
+        attempt_id = events.current("attempt_id")
+
         def _background():
+            events.bind(attempt_id=attempt_id)
             bg_run_id = timing.new_run_id()
             with timing.section("CONFIRM BACKGROUND", run_id=bg_run_id, job_id=job_id):
                 results = []
@@ -1418,7 +1466,20 @@ def confirm():
 
                     if grn_items:
                         with timing.section("SUBMITTING GRN", grn_items=len(grn_items)):
-                            results.extend(_submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date))
+                            try:
+                                results.extend(_submit_grn(
+                                    grn_items, shop_id, supplier_id, shop_name, grn_date, confirm_duplicate,
+                                ))
+                            except GrnRefused as refusal:
+                                results.extend(refusal.as_results(grn_items))
+                            except GrnDuplicate as dup:
+                                # No way to ask "submit anyway?" from inside a
+                                # background job — report it as not saved.
+                                results.extend([{
+                                    "raw_text": it.get("raw_text", ""),
+                                    "name": it.get("name") or it.get("raw_text", ""),
+                                    "success": False, "error": dup.message,
+                                } for it in grn_items])
                         job_store.update_job(job_id, done=total)
 
                     job_store.update_job(job_id, status="done", results=results)
@@ -1493,30 +1554,113 @@ _GRN_TYPE = "DIRECT"
 _GRN_CASH_PAYMENT_METHOD_ID = "TldVZ1lzSnVUejBPRjN5RVVkWnAxdz09"
 
 
-def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None):
+class GrnRefused(Exception):
+    """Raised by _submit_grn when any line is incomplete: nothing is created.
+
+    A GRN is one delivery note — saving only the complete lines would leave
+    the ERP's GRN quietly short of what was delivered, and nobody would know
+    which lines were dropped. So it's all or nothing, enforced here (not just
+    in the UI) so a replayed or direct call can't create a partial GRN either.
+    """
+
+    def __init__(self, incomplete):
+        self.incomplete = incomplete
+        by_reason = {}
+        for entry in incomplete:
+            by_reason.setdefault(entry["server_reason"], []).append(entry["text"])
+        parts = []
+        if "quantity_missing" in by_reason:
+            names = by_reason["quantity_missing"]
+            parts.append(f"{len(names)} line(s) have no quantity: {', '.join(names)}.")
+        if "not_found" in by_reason:
+            names = by_reason["not_found"]
+            parts.append(f"{len(names)} line(s) have no matching product: {', '.join(names)}.")
+        self.message = "Nothing was saved. " + " ".join(parts)
+        super().__init__(self.message)
+
+    def as_results(self, grn_items):
+        """Per-line failure results, for callers that report line by line."""
+        reasons = {e["text"]: e["server_reason"] for e in self.incomplete}
+        results = []
+        for item in grn_items:
+            name = item.get("name") or item.get("raw_text", "")
+            text = item.get("raw_text") or name
+            if text in reasons:
+                error = f"{name}: {self.message}"
+            else:
+                error = f"{name}: not saved — the GRN was refused because other lines are incomplete."
+            results.append({
+                "raw_text": item.get("raw_text", ""), "name": name,
+                "success": False, "error": error,
+            })
+        return results
+
+
+def _grn_incomplete_reason(item):
+    if not item.get("matched_product_id"):
+        return "not_found"
+    if item.get("quantity") is None:
+        return "quantity_missing"
+    return None
+
+
+# An identical payload to the shop's previous GRN only counts as a repeat
+# submit if it comes this soon after it; a same-lines delivery later is
+# treated as a genuinely new one.
+GRN_DUPLICATE_WINDOW_S = 15 * 60
+
+
+class GrnDuplicate(Exception):
+    """Raised by _submit_grn when the payload is identical to the shop's
+    previous GRN and the caller hasn't confirmed it's intentional."""
+
+    def __init__(self, shop_name, previous, line_count):
+        age = time.time() - previous["submitted_at"]
+        self.previous = {
+            "age_s": round(age), "lines": previous["lines"],
+            "attempt_id": previous.get("attempt_id"),
+        }
+        self.message = (
+            f"These {line_count} line(s) are identical to the last GRN submitted for "
+            f"{shop_name or 'this shop'} ({grn_store.age_text(age)}). Submit again?"
+        )
+        super().__init__(self.message)
+
+
+def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None, confirm_duplicate=False):
     """Create one GRN covering every goods_received item, mirroring how a
     real goods-received note bundles everything from one delivery together
     (rather than one API call per line item, like stock_update does).
+
+    All or nothing: if any line has no matched product or no quantity,
+    raises GrnRefused and creates nothing.
+
+    Raises GrnDuplicate if the payload is identical to this shop's previous
+    GRN submitted within GRN_DUPLICATE_WINDOW_S, unless confirm_duplicate
+    says the user chose to submit it again.
 
     grn_date: ISO date string chosen in the UI (defaults to today there);
     falls back to today here too in case an older/other caller omits it.
     """
     results = []
-    incomplete = [it for it in grn_items if not it.get("matched_product_id") or it.get("quantity") is None]
-    complete = [it for it in grn_items if it not in incomplete]
-    timing.log("grn_item_split", incomplete=len(incomplete), complete=len(complete))
+    started = time.perf_counter()
+    incomplete_items = [it for it in grn_items if _grn_incomplete_reason(it)]
+    complete = [it for it in grn_items if it not in incomplete_items]
+    timing.log("grn_item_split", incomplete=len(incomplete_items), complete=len(complete))
 
-    for item in incomplete:
-        name = item.get("name") or item.get("raw_text", "")
-        results.append({
-            "raw_text": item.get("raw_text", ""),
-            "name": name,
-            "success": False,
-            "error": f"{name}: no matched product or quantity — fix in the table before submitting.",
-        })
-
-    if not complete:
-        return results
+    if incomplete_items:
+        incomplete = [{
+            "text": it.get("raw_text") or it.get("name", ""),
+            "matched_product_id": it.get("matched_product_id"),
+            "server_reason": _grn_incomplete_reason(it),
+        } for it in incomplete_items]
+        events.log_event(
+            "grn_refused", "api", shop=shop_name, shop_id=shop_id,
+            lines_sent=len(grn_items), lines_complete=len(complete),
+            lines_incomplete=len(incomplete), grn_created=False, incomplete=incomplete,
+        )
+        timing.log("grn_refused", incomplete=len(incomplete), reason="incomplete_lines", created="none")
+        raise GrnRefused(incomplete)
 
     # Cost comes from the cached catalog (see get_catalog()) — no separate
     # API call, and the cache stores cost per product already.
@@ -1561,9 +1705,36 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None):
             "items": grn_line_items,
         }
 
+    fingerprint = grn_store.fingerprint(
+        shop_id, payload["grn_date"], [(i["product_id"], i["qty"]) for i in grn_line_items],
+    )
+    previous = grn_store.get(shop_id)
+    if (
+        previous and previous["fingerprint"] == fingerprint
+        and time.time() - previous["submitted_at"] <= GRN_DUPLICATE_WINDOW_S
+    ):
+        duplicate = GrnDuplicate(shop_name, previous, len(grn_line_items))
+        events.log_event(
+            "duplicate_submission", "api", level="WARN", shop=shop_name, shop_id=shop_id,
+            matches_attempt_id=previous.get("attempt_id"), age_s=duplicate.previous["age_s"],
+            lines=len(grn_line_items),
+            action="submitted_anyway" if confirm_duplicate else "asked_user",
+        )
+        if not confirm_duplicate:
+            raise duplicate
+
     try:
         with timing.timed("create_grn_api_call", line_items=len(grn_line_items)):
             grn_result = si_client.create_grn(payload)
+        grn_store.put(shop_id, fingerprint, len(grn_line_items), events.current("attempt_id"))
+        # POST /grn only acks; the GRN's number isn't known here (see
+        # core.py, which looks it up once for the WhatsApp text and logs it).
+        events.log_event(
+            "grn_created", "api", shop=shop_name, shop_id=shop_id,
+            grn_date=payload["grn_date"], lines_sent=len(grn_line_items),
+            erp_ack=((grn_result or {}).get("success") or {}).get("code") if isinstance(grn_result, dict) else None,
+            elapsed_ms=round((time.perf_counter() - started) * 1000),
+        )
         for item in complete:
             results.append({
                 "raw_text": item.get("raw_text", ""),
@@ -1571,8 +1742,12 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None):
                 "success": True,
                 "result": grn_result,
             })
-    except Exception:
+    except Exception as e:
         app.logger.exception(f"GRN creation failed for {len(complete)} item(s)")
+        events.log_event(
+            "grn_failed", "api", level="ERROR", shop=shop_name, shop_id=shop_id,
+            lines_sent=len(grn_line_items), error=events.body_head(str(e)),
+        )
         for item in complete:
             name = item.get("name") or item.get("raw_text", "")
             results.append({

@@ -5,6 +5,7 @@ import time
 
 import requests
 
+import events
 import timing
 
 BASE_URL = "https://api.salesintellectpos.com/v1.0"
@@ -27,14 +28,35 @@ class SalesIntellectClient:
 
     def _request(self, method, path, **kwargs):
         t0 = time.perf_counter()
-        response = self.session.request(method, f"{BASE_URL}{path}", **kwargs)
+        try:
+            response = self.session.request(method, f"{BASE_URL}{path}", **kwargs)
+        except Exception as e:
+            dur = time.perf_counter() - t0
+            timing.log(f"API {method} {path} FAILED", dur=dur, error=str(e))
+            events.log_event(
+                "erp_call_failed", "api", level="ERROR", method=method, path=path,
+                dur_ms=round(dur * 1000), error=events.body_head(str(e)),
+            )
+            raise
         dur = time.perf_counter() - t0
+        # Never log request headers (the bearer token lives there) — only the
+        # response, and only its body when the call failed.
+        fields = dict(
+            method=method, path=path, status=response.status_code,
+            dur_ms=round(dur * 1000), resp_bytes=len(response.content),
+            erp_request_id=response.headers.get("X-Request-ID") or response.headers.get("X-Amzn-Trace-Id"),
+        )
         if not response.ok:
             timing.log(f"API {method} {path} FAILED", dur=dur, status=response.status_code)
+            events.log_event(
+                "erp_call_failed", "api", level="ERROR",
+                body_head=events.body_head(response.text), **fields,
+            )
             raise Exception(
                 f"{method} {path} failed with status {response.status_code}: {response.text}"
             )
         timing.log(f"API {method} {path}", dur=dur, status=response.status_code)
+        events.log_event("erp_call", "api", **fields)
         return response.json()
 
     def list_products(self):
