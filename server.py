@@ -1787,7 +1787,7 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None, confi
                 cause = "rejected"
                 error = (
                     f"Sales Intellect rejected this line: {rejected[1]}. "
-                    "Fix it in Sales Intellect, then submit again."
+                    "Fix it in Sales Intellect, refresh catalog, then submit again."
                 )
             else:
                 cause = "blocked"

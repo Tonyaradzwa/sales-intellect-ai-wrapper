@@ -177,6 +177,7 @@ def test_api_rejecting_one_line_names_that_line_and_why(fake_si_client, event_lo
     first = results[0]  # the rejected line leads, with the API's reason
     assert first["name"] == "Item C"
     assert "GRN creation is restricted for products with stock control disabled" in first["error"]
+    assert first["error"].endswith("Fix it in Sales Intellect, refresh catalog, then submit again.")
     others = {r["name"]: r["error"] for r in results[1:]}
     assert set(others) == {"Item A", "Item B", "Item D"}
     assert all("Item C was rejected" in e for e in others.values())
