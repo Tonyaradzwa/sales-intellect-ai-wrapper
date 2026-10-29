@@ -1627,6 +1627,24 @@ class GrnDuplicate(Exception):
         super().__init__(self.message)
 
 
+def _rejected_line(exc, line_count):
+    """If the Sales Intellect API rejected one specific GRN line, returns
+    (index, detail): its error body names the field, e.g.
+    {"errors": {"code": "INVALID_VALUE", "field": "items[8].product_id",
+    "detail": "GRN creation is restricted for products with stock control
+    disabled"}}. The index is into the items we sent. None if the error
+    isn't about a line (auth, network, an index out of range...)."""
+    try:
+        errors = json.loads(getattr(exc, "body", "") or "")["errors"]
+        match = re.fullmatch(r"items\[(\d+)\]\..+", errors.get("field", ""))
+        index = int(match.group(1)) if match else None
+        if index is not None and index < line_count:
+            return index, errors.get("detail") or errors.get("code") or "rejected"
+    except Exception:
+        pass
+    return None
+
+
 def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None, confirm_duplicate=False):
     """Create one GRN covering every goods_received item, mirroring how a
     real goods-received note bundles everything from one delivery together
@@ -1744,18 +1762,37 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None, confi
             })
     except Exception as e:
         app.logger.exception(f"GRN creation failed for {len(complete)} item(s)")
+        rejected = _rejected_line(e, len(complete))
+        rejected_name = None
+        if rejected:
+            rejected_name = complete[rejected[0]].get("name") or complete[rejected[0]].get("raw_text", "")
         events.log_event(
             "grn_failed", "api", level="ERROR", shop=shop_name, shop_id=shop_id,
-            lines_sent=len(grn_line_items), error=events.body_head(str(e)),
+            lines_sent=len(grn_line_items), status=getattr(e, "status", None),
+            rejected_line=rejected[0] if rejected else None, rejected_name=rejected_name,
+            rejected_detail=rejected[1] if rejected else None, error=events.body_head(str(e)),
         )
-        for item in complete:
+        # The API checks the whole batch and names only the first bad line, so
+        # the one line it rejected goes first with its reason; the rest weren't
+        # at fault, they just weren't saved with it.
+        for i, item in enumerate(complete):
             name = item.get("name") or item.get("raw_text", "")
-            results.append({
+            if rejected is None:
+                error = f"Could not record goods received for {name} at {shop_name or 'this shop'}."
+            elif i == rejected[0]:
+                error = (
+                    f"Sales Intellect rejected this line: {rejected[1]}. "
+                    "Fix it in Sales Intellect, then submit again."
+                )
+            else:
+                error = f"Not saved — nothing in this GRN was created because {rejected_name} was rejected."
+            result = {
                 "raw_text": item.get("raw_text", ""),
                 "name": name,
                 "success": False,
-                "error": f"Could not record goods received for {name} at {shop_name or 'this shop'}.",
-            })
+                "error": error,
+            }
+            results.insert(0, result) if rejected and i == rejected[0] else results.append(result)
 
     return results
 

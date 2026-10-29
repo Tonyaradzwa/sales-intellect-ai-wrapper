@@ -75,7 +75,7 @@ One JSON object per line.
 | `si_call_failed` | same, plus `body_head` (first 300 chars) or `error` | A non-2xx or a connection error (`ERROR`). The token is never logged |
 | `grn_created` | `shop`, `shop_id`, `grn_date`, `lines_sent`, `si_ack`, `elapsed_ms` | `POST /grn` succeeded. The Sales Intellect API does not return the GRN number, so it is not here; see `grn_number_found` |
 | `grn_refused` | `lines_sent`, `lines_complete`, `lines_incomplete`, `incomplete[]` (`text`, `matched_product_id`, `server_reason`) | The server refused the whole GRN because lines had no quantity (`quantity_missing`) or no product (`not_found`). Nothing was created |
-| `grn_failed` | `lines_sent`, `error` | `POST /grn` raised (`ERROR`) |
+| `grn_failed` | `lines_sent`, `status`, `error`, and when the API names a bad line: `rejected_line` (position in the batch, from 0), `rejected_name`, `rejected_detail` | `POST /grn` raised (`ERROR`) |
 | `duplicate_submission` | `matches_attempt_id`, `age_s`, `lines`, `action` | The payload is identical to the shop's previous GRN, within 15 minutes. `action` is `asked_user` (a 409 went back) or `submitted_anyway` (the user confirmed) |
 
 ## Recipes
@@ -149,6 +149,7 @@ A repeat submit: `duplicate_submission` (api, then ui), and nothing is created. 
 - **`submit_resumed` right after every `submit_clicked`.** Normal. The click sets the busy flag and reruns; the rerun does the work.
 - **`si_call GET /grn` taking several seconds.** Expected on shops with many GRNs; it is the page's WhatsApp lookup.
 - **Two `si_call GET /grn` lines.** The client pages until it gets an empty page, so the second one returns nothing.
+- **A 401 on `POST /grn` that is not about the token.** The Sales Intellect API also uses 401 for validation errors, for example `INVALID_VALUE` with `"field":"items[8].product_id"` when a product has stock control turned off. Read the body (`body_head` in `si_call_failed`, or `rejected_detail` in `grn_failed`) before assuming a bad token. The page now shows that line first with the API's reason.
 - **`timings.log` times differ from `events.log`.** `timings.log` uses server local time and `events.log` uses UTC.
 
 ## Files this adds

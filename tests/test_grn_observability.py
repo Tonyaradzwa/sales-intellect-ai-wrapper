@@ -161,6 +161,44 @@ def test_identical_payload_after_the_15_minute_window_is_not_a_duplicate(fake_si
     assert fake_si_client.create_grn.call_count == 2
 
 
+def test_api_rejecting_one_line_names_that_line_and_why(fake_si_client, event_log, monkeypatch, tmp_path):
+    from client import SalesIntellectError
+    _catalog(monkeypatch, tmp_path)
+    body = (
+        '{"errors":{"code":"INVALID_VALUE","detail":"GRN creation is restricted for products '
+        'with stock control disabled","field":"items[2].product_id"}}'
+    )
+    fake_si_client.create_grn.side_effect = SalesIntellectError("POST", "/grn", 401, body)
+    lines = [_item("Item A", 1), _item("Item B", 2), _item("Item C", 5), _item("Item D", 1)]
+
+    results = _post_confirm(lines, headers={"X-Request-ID": "att-test04"}).get_json()["results"]
+
+    assert len(results) == 4 and not any(r["success"] for r in results)
+    first = results[0]  # the rejected line leads, with the API's reason
+    assert first["name"] == "Item C"
+    assert "GRN creation is restricted for products with stock control disabled" in first["error"]
+    others = {r["name"]: r["error"] for r in results[1:]}
+    assert set(others) == {"Item A", "Item B", "Item D"}
+    assert all("Item C was rejected" in e for e in others.values())
+    (failed,) = event_log("grn_failed")
+    assert failed["rejected_line"] == 2 and failed["rejected_name"] == "Item C"
+    assert failed["status"] == 401 and failed["attempt_id"] == "att-test04"
+
+
+def test_other_api_failures_keep_the_generic_message(fake_si_client, monkeypatch, tmp_path):
+    from client import SalesIntellectError
+    _catalog(monkeypatch, tmp_path)
+    for exc in (
+        SalesIntellectError("POST", "/grn", 500, "<html>oops</html>"),
+        SalesIntellectError("POST", "/grn", 401, '{"errors":{"code":"UNAUTHORIZED"}}'),
+        SalesIntellectError("POST", "/grn", 401, '{"errors":{"field":"items[9].product_id","detail":"x"}}'),  # out of range
+        RuntimeError("connection reset"),
+    ):
+        fake_si_client.create_grn.side_effect = exc
+        errors = [r["error"] for r in _post_confirm([_item("A", 1), _item("B", 2)]).get_json()["results"]]
+        assert all(e.startswith("Could not record goods received for") for e in errors)
+
+
 def test_different_quantity_or_shop_is_not_a_duplicate(fake_si_client, monkeypatch, tmp_path):
     _catalog(monkeypatch, tmp_path)
     fake_si_client.create_grn.return_value = {"success": {}}

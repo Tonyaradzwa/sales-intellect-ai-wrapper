@@ -15,6 +15,17 @@ BASE_URL = "https://api.salesintellectpos.com/v1.0"
 PAGE_LIMIT = 250
 
 
+class SalesIntellectError(Exception):
+    """A non-2xx response from the Sales Intellect API. str() is the same text
+    the plain Exception used to carry; status and body are kept so callers
+    can read the API's own explanation (e.g. which GRN line it rejected)."""
+
+    def __init__(self, method, path, status, body):
+        self.status = status
+        self.body = body
+        super().__init__(f"{method} {path} failed with status {status}: {body}")
+
+
 class SalesIntellectClient:
     def __init__(self, token=None):
         self.token = token or os.environ.get("SI_API_TOKEN")
@@ -52,9 +63,7 @@ class SalesIntellectClient:
                 "si_call_failed", "api", level="ERROR",
                 body_head=events.body_head(response.text), **fields,
             )
-            raise Exception(
-                f"{method} {path} failed with status {response.status_code}: {response.text}"
-            )
+            raise SalesIntellectError(method, path, response.status_code, response.text)
         timing.log(f"API {method} {path}", dur=dur, status=response.status_code)
         events.log_event("si_call", "api", **fields)
         return response.json()
