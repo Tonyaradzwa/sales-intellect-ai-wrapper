@@ -34,7 +34,7 @@ class SalesIntellectClient:
             dur = time.perf_counter() - t0
             timing.log(f"API {method} {path} FAILED", dur=dur, error=str(e))
             events.log_event(
-                "erp_call_failed", "api", level="ERROR", method=method, path=path,
+                "si_call_failed", "api", level="ERROR", method=method, path=path,
                 dur_ms=round(dur * 1000), error=events.body_head(str(e)),
             )
             raise
@@ -44,19 +44,19 @@ class SalesIntellectClient:
         fields = dict(
             method=method, path=path, status=response.status_code,
             dur_ms=round(dur * 1000), resp_bytes=len(response.content),
-            erp_request_id=response.headers.get("X-Request-ID") or response.headers.get("X-Amzn-Trace-Id"),
+            si_request_id=response.headers.get("X-Request-ID") or response.headers.get("X-Amzn-Trace-Id"),
         )
         if not response.ok:
             timing.log(f"API {method} {path} FAILED", dur=dur, status=response.status_code)
             events.log_event(
-                "erp_call_failed", "api", level="ERROR",
+                "si_call_failed", "api", level="ERROR",
                 body_head=events.body_head(response.text), **fields,
             )
             raise Exception(
                 f"{method} {path} failed with status {response.status_code}: {response.text}"
             )
         timing.log(f"API {method} {path}", dur=dur, status=response.status_code)
-        events.log_event("erp_call", "api", **fields)
+        events.log_event("si_call", "api", **fields)
         return response.json()
 
     def list_products(self):

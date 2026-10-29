@@ -113,7 +113,7 @@ def test_grn_created_is_logged_without_any_grn_lookup(fake_si_client, event_log,
     fake_si_client.get_grn.assert_not_called()  # the server no longer downloads GRNs to find a number
     (created,) = event_log("grn_created")
     assert created["attempt_id"] == "att-test02" and created["lines_sent"] == 2
-    assert created["erp_ack"] == "SUCCESS" and "grn_number" not in created
+    assert created["si_ack"] == "SUCCESS" and "grn_number" not in created
 
 
 def test_identical_payload_to_previous_grn_asks_before_creating(fake_si_client, event_log, monkeypatch, tmp_path):
@@ -176,7 +176,7 @@ def test_different_quantity_or_shop_is_not_a_duplicate(fake_si_client, monkeypat
 
 def test_refused_or_failed_grn_does_not_become_the_previous_one(fake_si_client, monkeypatch, tmp_path):
     _catalog(monkeypatch, tmp_path)
-    fake_si_client.create_grn.side_effect = [RuntimeError("erp down"), {"success": {}}]
+    fake_si_client.create_grn.side_effect = [RuntimeError("API down"), {"success": {}}]
 
     assert _post_confirm([_item("A", 1)]).get_json()["results"][0]["success"] is False
     assert _post_confirm([_item("A", 1)]).status_code == 200  # retry after a failure is fine
@@ -275,7 +275,7 @@ def test_page_logs_the_grn_number_from_its_existing_lookup(grn_skip_review, even
     assert [t.value for t in at.toast] == ["Saved GRN-10042 with 2 line(s)."]
 
 
-def test_erp_call_events_log_status_and_body_only_on_failure(event_log, monkeypatch):
+def test_si_call_events_log_status_and_body_only_on_failure(event_log, monkeypatch):
     import client as client_module
 
     class Resp:
@@ -299,7 +299,7 @@ def test_erp_call_events_log_status_and_body_only_on_failure(event_log, monkeypa
     with pytest.raises(Exception):
         c._request("POST", "/grn", json={})
 
-    ok, failed = event_log("erp_call")[0], event_log("erp_call_failed")[0]
+    ok, failed = event_log("si_call")[0], event_log("si_call_failed")[0]
     assert ok["attempt_id"] == "att-test03" and ok["status"] == 200 and "body_head" not in ok
     assert failed["status"] == 401 and failed["level"] == "ERROR"
     assert len(failed["body_head"]) <= events.BODY_HEAD_CHARS + 1

@@ -54,7 +54,7 @@ app = Flask(__name__)
 def _bind_attempt_id():
     # The Streamlit app sends its attempt_id as X-Request-ID; binding it here
     # puts it on every events.log / timings.log line this request writes
-    # (client.py's ERP calls included). Background threads re-bind it themselves.
+    # (client.py's Sales Intellect API calls included). Background threads re-bind it themselves.
     events.bind(attempt_id=request.headers.get("X-Request-ID"))
 
 
@@ -1558,7 +1558,7 @@ class GrnRefused(Exception):
     """Raised by _submit_grn when any line is incomplete: nothing is created.
 
     A GRN is one delivery note — saving only the complete lines would leave
-    the ERP's GRN quietly short of what was delivered, and nobody would know
+    the Sales Intellect GRN quietly short of what was delivered, and nobody would know
     which lines were dropped. So it's all or nothing, enforced here (not just
     in the UI) so a replayed or direct call can't create a partial GRN either.
     """
@@ -1732,7 +1732,7 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None, confi
         events.log_event(
             "grn_created", "api", shop=shop_name, shop_id=shop_id,
             grn_date=payload["grn_date"], lines_sent=len(grn_line_items),
-            erp_ack=((grn_result or {}).get("success") or {}).get("code") if isinstance(grn_result, dict) else None,
+            si_ack=((grn_result or {}).get("success") or {}).get("code") if isinstance(grn_result, dict) else None,
             elapsed_ms=round((time.perf_counter() - started) * 1000),
         )
         for item in complete:

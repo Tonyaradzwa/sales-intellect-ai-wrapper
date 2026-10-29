@@ -727,7 +727,7 @@ def _submit_items(
             error = resp.json().get("error", resp.text)
             if resp.status_code == 409 and resp.json().get("duplicate"):
                 # Identical to this shop's previous GRN (see server._submit_grn)
-                # — nothing was sent to the ERP. Park the batch and ask; the
+                # — nothing was sent to the Sales Intellect API. Park the batch and ask; the
                 # prompt (_render_duplicate_prompt) resubmits with
                 # confirm_duplicate if the user says it's intentional.
                 previous = resp.json().get("previous") or {}
@@ -822,7 +822,7 @@ def _submit_items(
                     grn = _latest_grn(selected_shop_id)
                     st.session_state[f"{key_prefix}_grn_copy_text"] = _grn_whatsapp_text(selected_shop_id, grn)
                 if grn:
-                    # The ERP's create call never says which GRN it made; this
+                    # The Sales Intellect API's create call never says which GRN it made; this
                     # lookup (already needed for the WhatsApp text) is the one
                     # place the number is learned, so it's logged here.
                     grn_number = grn.get("grn_number")

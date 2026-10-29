@@ -3,9 +3,10 @@ when a new submit is identical to it (the same delivery sent twice).
 
 Only the previous GRN's payload fingerprint is kept — one entry per shop,
 replaced on every successful submit — so there is nothing to look up in the
-ERP afterwards. File-backed (like job_store.py) because gunicorn runs several
-worker processes, and the warning must work whichever one handled the last
-submit. The read-modify-write is guarded by an flock for the same reason.
+Sales Intellect API afterwards. File-backed (like job_store.py) because
+gunicorn runs several worker processes, and the warning must work whichever
+one handled the last submit. The read-modify-write is guarded by an flock for
+the same reason.
 """
 
 import fcntl
