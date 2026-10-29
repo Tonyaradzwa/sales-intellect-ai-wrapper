@@ -1631,7 +1631,7 @@ def _rejected_line(exc, line_count):
     """If the Sales Intellect API rejected one specific GRN line, returns
     (index, detail): its error body names the field, e.g.
     {"errors": {"code": "INVALID_VALUE", "field": "items[8].product_id",
-    "detail": "GRN creation is restricted for products with stock control
+    "details": "GRN creation is restricted for products with stock control
     disabled"}}. The index is into the items we sent. None if the error
     isn't about a line (auth, network, an index out of range...)."""
     try:
@@ -1639,7 +1639,10 @@ def _rejected_line(exc, line_count):
         match = re.fullmatch(r"items\[(\d+)\]\..+", errors.get("field", ""))
         index = int(match.group(1)) if match else None
         if index is not None and index < line_count:
-            return index, errors.get("detail") or errors.get("code") or "rejected"
+            # The API spells the explanation "details" (seen live), and may use
+            # "detail" or "message" elsewhere — take whichever is there.
+            reason = errors.get("details") or errors.get("detail") or errors.get("message")
+            return index, reason or errors.get("code") or "rejected"
     except Exception:
         pass
     return None
@@ -1778,19 +1781,26 @@ def _submit_grn(grn_items, shop_id, supplier_id, shop_name, grn_date=None, confi
         for i, item in enumerate(complete):
             name = item.get("name") or item.get("raw_text", "")
             if rejected is None:
+                cause = "batch"
                 error = f"Could not record goods received for {name} at {shop_name or 'this shop'}."
             elif i == rejected[0]:
+                cause = "rejected"
                 error = (
                     f"Sales Intellect rejected this line: {rejected[1]}. "
                     "Fix it in Sales Intellect, then submit again."
                 )
             else:
+                cause = "blocked"
                 error = f"Not saved — nothing in this GRN was created because {rejected_name} was rejected."
+            # "cause" lets the page show one line for the batch instead of a
+            # row per product: "rejected" (this line was the problem),
+            # "blocked" (fine, but not saved with it), "batch" (whole call failed).
             result = {
                 "raw_text": item.get("raw_text", ""),
                 "name": name,
                 "success": False,
                 "error": error,
+                "cause": cause,
             }
             results.insert(0, result) if rejected and i == rejected[0] else results.append(result)
 

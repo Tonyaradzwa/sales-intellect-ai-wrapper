@@ -165,7 +165,7 @@ def test_api_rejecting_one_line_names_that_line_and_why(fake_si_client, event_lo
     from client import SalesIntellectError
     _catalog(monkeypatch, tmp_path)
     body = (
-        '{"errors":{"code":"INVALID_VALUE","detail":"GRN creation is restricted for products '
+        '{"errors":{"code":"INVALID_VALUE","details":"GRN creation is restricted for products '
         'with stock control disabled","field":"items[2].product_id"}}'
     )
     fake_si_client.create_grn.side_effect = SalesIntellectError("POST", "/grn", 401, body)
@@ -183,6 +183,20 @@ def test_api_rejecting_one_line_names_that_line_and_why(fake_si_client, event_lo
     (failed,) = event_log("grn_failed")
     assert failed["rejected_line"] == 2 and failed["rejected_name"] == "Item C"
     assert failed["status"] == 401 and failed["attempt_id"] == "att-test04"
+
+
+def test_rejection_reason_is_read_from_details_detail_or_message(fake_si_client, monkeypatch, tmp_path):
+    from client import SalesIntellectError
+    _catalog(monkeypatch, tmp_path)
+    for key in ("details", "detail", "message"):
+        body = '{"errors":{"code":"INVALID_VALUE","%s":"Some specific reason","field":"items[0].product_id"}}' % key
+        fake_si_client.create_grn.side_effect = SalesIntellectError("POST", "/grn", 401, body)
+        first = _post_confirm([_item("Item A", 1), _item("Item B", 2)]).get_json()["results"][0]
+        assert "Some specific reason" in first["error"], key
+    # No explanation at all: fall back to the code rather than showing nothing.
+    body = '{"errors":{"code":"INVALID_VALUE","field":"items[0].product_id"}}'
+    fake_si_client.create_grn.side_effect = SalesIntellectError("POST", "/grn", 401, body)
+    assert "INVALID_VALUE" in _post_confirm([_item("Item A", 1)]).get_json()["results"][0]["error"]
 
 
 def test_other_api_failures_keep_the_generic_message(fake_si_client, monkeypatch, tmp_path):
@@ -452,3 +466,64 @@ def test_missing_quantity_is_flagged_on_the_page_and_blocks_submit(grn_skip_revi
     assert not at.exception, at.exception
     (batch,) = grn_skip_review["confirmed"]
     assert [i["quantity"] for i in batch["items"]] == [5, 4]
+
+
+def _page_showing_confirm_results(grn_skip_review, monkeypatch, results):
+    """Runs a GRN submit whose /confirm response carries `results`, returns the AppTest."""
+    import requests
+    from streamlit.testing.v1 import AppTest
+
+    inner_post = requests.post
+
+    def post(url, json=None, timeout=None, headers=None):
+        if url.endswith("/confirm"):
+            return FakeResponse(200, {"results": results})
+        return inner_post(url, json=json, timeout=timeout, headers=headers)
+
+    monkeypatch.setattr(requests, "post", post)
+    grn_skip_review["parse_items"] = PARSE_CLEAN
+    at = AppTest.from_file(str(APP_DIR / "app.py"))
+    at.run()
+    at.switch_page("pages/goods_received.py")
+    at.run()
+    _start(at)
+    at.text_area(key="grn_paste_input").set_value("anything").run()
+    at.button(key="grn_submit_btn").click().run()
+    assert not at.exception, at.exception
+    return at
+
+
+def _fail(name, cause=None, error="x"):
+    row = {"raw_text": name, "name": name, "success": False, "error": error}
+    if cause:
+        row["cause"] = cause
+    return row
+
+
+def test_page_shows_only_the_rejected_line_and_one_summary(grn_skip_review, monkeypatch):
+    results = [_fail("Item C", "rejected", "Sales Intellect rejected this line: Some reason.")] + [
+        _fail(f"Item {n}", "blocked", "Not saved — nothing in this GRN was created because Item C was rejected.")
+        for n in "ABDEFG"
+    ]
+    at = _page_showing_confirm_results(grn_skip_review, monkeypatch, results)
+
+    assert [e.value for e in at.error] == ["✗ Item C — Sales Intellect rejected this line: Some reason."]
+    assert [w.value for w in at.warning] == ["6 other line(s) were not saved. Nothing in this GRN was created."]
+    assert not any("Item A" in m.value for m in at.markdown)
+
+
+def test_page_shows_one_line_when_the_whole_call_failed(grn_skip_review, monkeypatch):
+    results = [_fail(f"Item {n}", "batch", f"Could not record goods received for Item {n} at Branch A.") for n in "ABC"]
+    at = _page_showing_confirm_results(grn_skip_review, monkeypatch, results)
+
+    (error,) = at.error
+    assert "Could not record this GRN — nothing was saved (3 line(s))." in error.value
+    assert "Item A" not in error.value
+
+
+def test_page_keeps_one_row_per_item_when_results_have_no_cause(grn_skip_review, monkeypatch):
+    results = [{"raw_text": "Item A", "name": "Item A", "success": True}, _fail("Item B", error="No stock"), _fail("Item C", error="No stock")]
+    at = _page_showing_confirm_results(grn_skip_review, monkeypatch, results)
+
+    assert [e.value for e in at.error] == ["✗ Item B — No stock", "✗ Item C — No stock"]
+    assert [s.value for s in at.success] == ["✓ Item A"]

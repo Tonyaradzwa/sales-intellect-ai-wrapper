@@ -1644,12 +1644,37 @@ def render_parse_tab(
         if all(r["success"] for r in results):
             st.success(f"✓ All {len(results)} item(s) submitted successfully.")
         else:
-            for r in results:
-                label = r.get("name") or r["raw_text"]
-                if r["success"]:
-                    st.success(f"✓ {label}")
-                else:
-                    st.error(f"✗ {label} — {r['error']}")
+            _render_failed_results(results)
+
+
+def _render_failed_results(results):
+    """Failures from a single GRN call are one problem, not one per product:
+    show the line the API rejected (if it named one) and a single summary for
+    the rest, instead of a row for every product in the batch. Results without
+    a server-assigned "cause" (stock updates, per-item loops) keep one row each."""
+    batch_causes = {"rejected", "blocked", "batch"}
+    if not all(r["success"] or r.get("cause") in batch_causes for r in results) or not any(
+        r.get("cause") in batch_causes for r in results
+    ):
+        for r in results:
+            label = r.get("name") or r["raw_text"]
+            if r["success"]:
+                st.success(f"✓ {label}")
+            else:
+                st.error(f"✗ {label} — {r['error']}")
+        return
+
+    for r in results:
+        if r.get("cause") == "rejected":
+            st.error(f"✗ {r.get('name') or r['raw_text']} — {r['error']}")
+    unsaved = sum(1 for r in results if r.get("cause") in ("blocked", "batch"))
+    if any(r.get("cause") == "batch" for r in results):
+        st.error(
+            f"✗ Could not record this GRN — nothing was saved ({unsaved} line(s)). "
+            "Try again; if it keeps failing, note the time of this submit and tell support."
+        )
+    elif unsaved:
+        st.warning(f"{unsaved} other line(s) were not saved. Nothing in this GRN was created.")
 
 
 def render_production_banner():
